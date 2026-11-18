@@ -7,6 +7,8 @@ import {
   type QuizInsights,
   type RevenueBreakdown,
   type TeamSeats,
+  DROP_OFF_INACTIVE_DAYS,
+  type DropOffLesson,
 } from "~/services/instructorAnalyticsService";
 import { getUserById } from "~/services/userService";
 import { getCurrentUserId } from "~/lib/session";
@@ -79,6 +81,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   return {
     course: { id: course.id, title: course.title },
     ...getCourseAnalytics(course.id),
+    dropOffInactiveDays: DROP_OFF_INACTIVE_DAYS,
   };
 }
 
@@ -337,6 +340,46 @@ function QuizInsightsSection({ insights }: { insights: QuizInsights }) {
   );
 }
 
+function DropOffSection({
+  lessons,
+  inactiveDays,
+}: {
+  lessons: DropOffLesson[];
+  inactiveDays: number;
+}) {
+  return (
+    <SectionCard
+      title="Drop-off lessons"
+      description={`Where students who haven't finished stopped, after ${inactiveDays}+ days without activity`}
+    >
+      {lessons.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          No students have dropped off
+        </p>
+      ) : (
+        <ol className="divide-y divide-border">
+          {lessons.map((lesson, i) => (
+            <li
+              key={lesson.lessonId}
+              className="flex items-baseline justify-between gap-4 py-1.5 text-sm"
+            >
+              <span>
+                <span className="mr-2 text-muted-foreground tabular-nums">
+                  {i + 1}.
+                </span>
+                {lesson.lessonTitle}
+              </span>
+              <span className="font-medium tabular-nums">
+                {plural(lesson.students, "student")}
+              </span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </SectionCard>
+  );
+}
+
 function SectionSkeleton() {
   return (
     <Card>
@@ -369,6 +412,7 @@ export function HydrateFallback() {
         ))}
       </div>
       <div className="space-y-6">
+        <SectionSkeleton />
         <SectionSkeleton />
         <SectionSkeleton />
         <SectionSkeleton />
@@ -412,6 +456,10 @@ export default function CourseAnalytics({ loaderData }: Route.ComponentProps) {
         <RevenueSection revenue={revenue} totalCents={headline.revenueCents} />
         <TeamSeatsSection seats={seats} />
         <QuizInsightsSection insights={loaderData.quizInsights} />
+        <DropOffSection
+          lessons={loaderData.dropOffLessons}
+          inactiveDays={loaderData.dropOffInactiveDays}
+        />
       </div>
     </div>
   );

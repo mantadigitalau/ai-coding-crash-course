@@ -14,7 +14,9 @@ vi.mock("~/db", () => ({
 
 // Import after mock so the module picks up our test db
 import {
+  DROP_OFF_INACTIVE_DAYS,
   getCourseAnalytics,
+  getCourseStudentsWithActivity,
   getInstructorDashboard,
 } from "./instructorAnalyticsService";
 
@@ -211,6 +213,50 @@ function rate(userId: number, courseId: number, rating: number) {
     .values({ userId, courseId, rating })
     .returning()
     .get();
+}
+
+/** Adds a module at `position` with lessons titled `titles`, in order. */
+function createModule(courseId: number, position: number, titles: string[]) {
+  const mod = testDb
+    .insert(schema.modules)
+    .values({ courseId, title: `Module ${position}`, position })
+    .returning()
+    .get();
+  return titles.map((title, i) =>
+    testDb
+      .insert(schema.lessons)
+      .values({ moduleId: mod.id, title, position: i + 1 })
+      .returning()
+      .get()
+  );
+}
+
+function completeLesson(userId: number, lessonId: number, completedAt: string) {
+  testDb
+    .insert(schema.lessonProgress)
+    .values({
+      userId,
+      lessonId,
+      status: schema.LessonProgressStatus.Completed,
+      completedAt,
+    })
+    .run();
+}
+
+function watchVideo(userId: number, lessonId: number, createdAt: string) {
+  testDb
+    .insert(schema.videoWatchEvents)
+    .values({ userId, lessonId, eventType: "play", positionSeconds: 0, createdAt })
+    .run();
+}
+
+function studentRow(
+  roster: ReturnType<typeof getCourseStudentsWithActivity>,
+  userId: number
+) {
+  const row = roster.students.find((s) => s.userId === userId);
+  if (!row) throw new Error(`No student row for user ${userId}`);
+  return row;
 }
 
 function rowFor(
@@ -606,6 +652,226 @@ describe("instructorAnalyticsService", () => {
       expect(byText.get("Split")).toBe("Wrong B");
       expect(byText.get("Tied")).toBe("Wrong A");
       expect(byText.get("All right")).toBeNull();
+    });
+  });
+
+  describe("getCourseStudentsWithActivity", () => {
+    it("takes the latest of lesson completion, quiz attempt and video watch as last activity", () => {
+      const [lesson] = createModule(base.course.id, 2, ["Intro"]);
+      const quiz = createQuiz(base.course.id);
+      const byLesson = createStudent();
+      const byQuiz = createStudent();
+      const byVideo = createStudent();
+      const idle = createStudent();
+      for (const s of [byLesson, byQuiz, byVideo, idle]) {
+        enroll(s.id, base.course.id);
+      }
+      completeLesson(byLesson.id, lesson.id, daysBefore(3));
+      attempt(byLesson.id, quiz.id, 0.5, daysBefore(9));
+      watchVideo(byLesson.id, lesson.id, daysBefore(8));
+
+      completeLesson(byQuiz.id, lesson.id, daysBefore(9));
+      attempt(byQuiz.id, quiz.id, 0.5, daysBefore(2));
+      watchVideo(byQuiz.id, lesson.id, daysBefore(8));
+
+      completeLesson(byVideo.id, lesson.id, daysBefore(9));
+      attempt(byVideo.id, quiz.id, 0.5, daysBefore(8));
+      watchVideo(byVideo.id, lesson.id, daysBefore(1));
+
+      // Activity in another course doesn't count.
+      const [otherLesson] = createModule(createCourse("Other Course").id, 1, ["X"]);
+      watchVideo(idle.id, otherLesson.id, daysBefore(1));
+
+      const roster = getCourseStudentsWithActivity(base.course.id);
+
+      expect(studentRow(roster, byLesson.id).lastActivityAt).toBe(daysBefore(3));
+      expect(studentRow(roster, byQuiz.id).lastActivityAt).toBe(daysBefore(2));
+      expect(studentRow(roster, byVideo.id).lastActivityAt).toBe(daysBefore(1));
+      expect(studentRow(roster, idle.id).lastActivityAt).toBeNull();
+    });
+
+    it("keeps the roster's existing columns: identity, dates, progress and best score per quiz", () => {
+      const [l1, l2] = createModule(base.course.id, 1, ["One", "Two"]);
+      const [l3, l4] = createModule(base.course.id, 2, ["Three", "Four"]);
+      const quizA = testDb
+        .insert(schema.quizzes)
+        .values({ lessonId: l2.id, title: "Quiz A", passingScore: 0.7 })
+        .returning()
+        .get();
+      const quizB = testDb
+        .insert(schema.quizzes)
+        .values({ lessonId: l4.id, title: "Quiz B", passingScore: 0.7 })
+        .returning()
+        .get();
+      const alice = createStudent();
+      const bob = createStudent();
+      enroll(alice.id, base.course.id, daysBefore(30), daysBefore(2));
+      enroll(bob.id, base.course.id, daysBefore(20));
+      for (const lesson of [l1, l2, l3, l4]) {
+        completeLesson(alice.id, lesson.id, daysBefore(3));
+      }
+      completeLesson(bob.id, l1.id, daysBefore(5));
+      attempt(alice.id, quizA.id, 0.5, daysBefore(6));
+      attempt(alice.id, quizA.id, 0.9, daysBefore(5));
+      attempt(alice.id, quizA.id, 0.6, daysBefore(4));
+      attempt(alice.id, quizB.id, 0.4, daysBefore(4));
+      // An in-progress lesson doesn't count towards progress.
+      testDb
+        .insert(schema.lessonProgress)
+        .values({
+          userId: bob.id,
+          lessonId: l2.id,
+          status: schema.LessonProgressStatus.InProgress,
+        })
+        .run();
+
+      const roster = getCourseStudentsWithActivity(base.course.id);
+
+      expect(roster.quizCount).toBe(2);
+      expect(roster.students.map((s) => s.userId)).toEqual([alice.id, bob.id]);
+      expect(studentRow(roster, alice.id)).toMatchObject({
+        name: alice.name,
+        email: alice.email,
+        enrolledAt: daysBefore(30),
+        completedAt: daysBefore(2),
+        progress: 100,
+        quizScores: [
+          { quizId: quizA.id, quizTitle: "Quiz A", lessonTitle: "Two", bestScore: 0.9, passed: true },
+          { quizId: quizB.id, quizTitle: "Quiz B", lessonTitle: "Four", bestScore: 0.4, passed: false },
+        ],
+      });
+      expect(studentRow(roster, bob.id)).toMatchObject({
+        completedAt: null,
+        progress: 25,
+        quizScores: [
+          { quizId: quizA.id, bestScore: null, passed: null },
+          { quizId: quizB.id, bestScore: null, passed: null },
+        ],
+      });
+    });
+
+    it("reports zero progress and no quizzes for a course without lessons", () => {
+      const alice = createStudent();
+      enroll(alice.id, base.course.id);
+
+      const roster = getCourseStudentsWithActivity(base.course.id);
+
+      expect(roster.quizCount).toBe(0);
+      expect(studentRow(roster, alice.id)).toMatchObject({
+        progress: 0,
+        quizScores: [],
+        lastActivityAt: null,
+      });
+    });
+  });
+
+  describe("getCourseAnalytics dropOffLessons", () => {
+    it("counts a student as dropped off once their last activity is 14 or more days ago", () => {
+      expect(DROP_OFF_INACTIVE_DAYS).toBe(14);
+      const [l1, l2] = createModule(base.course.id, 1, ["One", "Two"]);
+      const exactly14 = createStudent();
+      const justUnder14 = createStudent();
+      enroll(exactly14.id, base.course.id);
+      enroll(justUnder14.id, base.course.id);
+      completeLesson(exactly14.id, l1.id, daysBefore(14));
+      completeLesson(justUnder14.id, l1.id, daysBefore(20));
+      // A later video watch keeps this student active.
+      watchVideo(
+        justUnder14.id,
+        l2.id,
+        new Date(NOW.getTime() - 14 * 86_400_000 + 1).toISOString()
+      );
+
+      const { dropOffLessons } = getCourseAnalytics(base.course.id, NOW);
+
+      expect(dropOffLessons).toEqual([
+        { lessonId: l2.id, lessonTitle: "Two", students: 1 },
+      ]);
+    });
+
+    it("excludes students who completed the course, however long ago", () => {
+      const [l1] = createModule(base.course.id, 1, ["One", "Two"]);
+      const finished = createStudent();
+      enroll(finished.id, base.course.id, daysBefore(90), daysBefore(60));
+      completeLesson(finished.id, l1.id, daysBefore(60));
+
+      expect(getCourseAnalytics(base.course.id, NOW).dropOffLessons).toEqual([]);
+    });
+
+    it("attributes the drop-off to the next lesson in course order, across module boundaries", () => {
+      // Module 2 is inserted first to prove ordering uses positions, not ids.
+      const [m2l1] = createModule(base.course.id, 2, ["Module 2 Lesson 1"]);
+      const [, m1l2] = createModule(base.course.id, 1, ["M1 L1", "M1 L2"]);
+      const student = createStudent();
+      enroll(student.id, base.course.id);
+      completeLesson(student.id, m1l2.id, daysBefore(30));
+
+      expect(getCourseAnalytics(base.course.id, NOW).dropOffLessons).toEqual([
+        { lessonId: m2l1.id, lessonTitle: "Module 2 Lesson 1", students: 1 },
+      ]);
+    });
+
+    it("uses the furthest completed lesson in course order, not the most recent", () => {
+      const [l1, l2, l3] = createModule(base.course.id, 1, ["One", "Two", "Three"]);
+      const student = createStudent();
+      enroll(student.id, base.course.id);
+      completeLesson(student.id, l2.id, daysBefore(40));
+      completeLesson(student.id, l1.id, daysBefore(30));
+
+      expect(getCourseAnalytics(base.course.id, NOW).dropOffLessons).toEqual([
+        { lessonId: l3.id, lessonTitle: "Three", students: 1 },
+      ]);
+    });
+
+    it("puts a student with no completed lessons at the first lesson, using their enrollment date when they have no activity", () => {
+      const [first] = createModule(base.course.id, 1, ["First", "Second"]);
+      const longAgo = createStudent();
+      const recent = createStudent();
+      enroll(longAgo.id, base.course.id, daysBefore(30));
+      enroll(recent.id, base.course.id, daysBefore(3));
+
+      expect(getCourseAnalytics(base.course.id, NOW).dropOffLessons).toEqual([
+        { lessonId: first.id, lessonTitle: "First", students: 1 },
+      ]);
+    });
+
+    it("attributes a student who completed the final lesson but skipped one to the first lesson they skipped", () => {
+      const [l1, l2, l3] = createModule(base.course.id, 1, ["One", "Two", "Three"]);
+      const student = createStudent();
+      enroll(student.id, base.course.id);
+      completeLesson(student.id, l1.id, daysBefore(30));
+      completeLesson(student.id, l3.id, daysBefore(30));
+
+      expect(getCourseAnalytics(base.course.id, NOW).dropOffLessons).toEqual([
+        { lessonId: l2.id, lessonTitle: "Two", students: 1 },
+      ]);
+    });
+
+    it("returns the top 3 lessons by student count, ties in course order", () => {
+      const lessons = createModule(base.course.id, 1, ["A", "B", "C", "D", "E"]);
+      // Drop-offs: A×1, B×2, C×1, D×3, E×0. C's student is enrolled before
+      // A's, so the A-over-C tie-break must come from course order.
+      const plan: [number, number][] = [
+        [2, 1],
+        [3, 3],
+        [1, 2],
+        [0, 1],
+      ];
+      for (const [index, count] of plan) {
+        for (let i = 0; i < count; i++) {
+          const student = createStudent();
+          enroll(student.id, base.course.id, daysBefore(60));
+          for (const lesson of lessons.slice(0, index)) {
+            completeLesson(student.id, lesson.id, daysBefore(30));
+          }
+        }
+      }
+
+      expect(getCourseAnalytics(base.course.id, NOW).dropOffLessons).toEqual([
+        { lessonId: lessons[3].id, lessonTitle: "D", students: 3 },
+        { lessonId: lessons[1].id, lessonTitle: "B", students: 2 },
+        { lessonId: lessons[0].id, lessonTitle: "A", students: 1 },
+      ]);
     });
   });
 });

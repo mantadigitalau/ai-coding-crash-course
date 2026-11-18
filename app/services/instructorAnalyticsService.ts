@@ -1,11 +1,13 @@
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { db } from "~/db";
 import {
   coupons,
   courseRatings,
   courses,
   enrollments,
+  lessonProgress,
   lessons,
+  LessonProgressStatus,
   modules,
   purchases,
   quizAnswers,
@@ -13,6 +15,8 @@ import {
   quizOptions,
   quizQuestions,
   quizzes,
+  users,
+  videoWatchEvents,
   type CourseStatus,
 } from "~/db/schema";
 import { getDiscountForCountry } from "~/lib/ppp";
@@ -303,6 +307,7 @@ export type CourseAnalytics = {
   revenue: RevenueBreakdown;
   seats: TeamSeats;
   quizInsights: QuizInsights;
+  dropOffLessons: DropOffLesson[];
 };
 
 /** Gross revenue split two ways; each pair sums to the course's gross revenue. */
@@ -372,6 +377,7 @@ export function getCourseAnalytics(
     revenue: getRevenueBreakdown(courseId, course?.pppEnabled ?? false),
     seats: getTeamSeats(courseId),
     quizInsights: getQuizInsights(courseId),
+    dropOffLessons: getDropOffLessons(courseId, now),
   };
 }
 
@@ -572,4 +578,292 @@ function getHardestQuestions(quizIds: number[]): HardQuestion[] {
     correctRate: q.correct / q.answers,
     mostCommonWrongOption: wrongByQuestion.get(q.questionId) ?? null,
   }));
+}
+
+// ─── Student activity ───
+
+/** Each student's last activity in a course, keyed by user id. */
+type LastActivity = Map<number, string>;
+
+/**
+ * Latest of lesson completion, quiz attempt and video watch event per student,
+ * within `courseId`. ISO strings compare correctly as text.
+ */
+function getLastActivityByUser(courseId: number): LastActivity {
+  const lessonCompletions = db
+    .select({
+      userId: lessonProgress.userId,
+      at: sql<string | null>`max(${lessonProgress.completedAt})`,
+    })
+    .from(lessonProgress)
+    .innerJoin(lessons, eq(lessons.id, lessonProgress.lessonId))
+    .innerJoin(modules, eq(modules.id, lessons.moduleId))
+    .where(eq(modules.courseId, courseId))
+    .groupBy(lessonProgress.userId)
+    .all();
+  const quizAttemptTimes = db
+    .select({
+      userId: quizAttempts.userId,
+      at: sql<string | null>`max(${quizAttempts.attemptedAt})`,
+    })
+    .from(quizAttempts)
+    .innerJoin(quizzes, eq(quizzes.id, quizAttempts.quizId))
+    .innerJoin(lessons, eq(lessons.id, quizzes.lessonId))
+    .innerJoin(modules, eq(modules.id, lessons.moduleId))
+    .where(eq(modules.courseId, courseId))
+    .groupBy(quizAttempts.userId)
+    .all();
+  const videoWatchTimes = db
+    .select({
+      userId: videoWatchEvents.userId,
+      at: sql<string | null>`max(${videoWatchEvents.createdAt})`,
+    })
+    .from(videoWatchEvents)
+    .innerJoin(lessons, eq(lessons.id, videoWatchEvents.lessonId))
+    .innerJoin(modules, eq(modules.id, lessons.moduleId))
+    .where(eq(modules.courseId, courseId))
+    .groupBy(videoWatchEvents.userId)
+    .all();
+
+  const latest: LastActivity = new Map();
+  for (const row of [
+    ...lessonCompletions,
+    ...quizAttemptTimes,
+    ...videoWatchTimes,
+  ]) {
+    if (row.at === null) continue;
+    const current = latest.get(row.userId);
+    if (current === undefined || row.at > current) {
+      latest.set(row.userId, row.at);
+    }
+  }
+  return latest;
+}
+
+export type StudentQuizScore = {
+  quizId: number;
+  quizTitle: string;
+  lessonTitle: string;
+  bestScore: number | null;
+  passed: boolean | null;
+};
+
+export type StudentWithActivity = {
+  userId: number;
+  name: string;
+  email: string;
+  enrolledAt: string;
+  completedAt: string | null;
+  /** Share of the course's lessons completed, 0..100 (rounded). */
+  progress: number;
+  /** Best attempt per quiz in course order; nulls when not attempted. */
+  quizScores: StudentQuizScore[];
+  /** Latest lesson completion, quiz attempt or video watch; null when none. */
+  lastActivityAt: string | null;
+};
+
+export type CourseStudentsWithActivity = {
+  students: StudentWithActivity[];
+  quizCount: number;
+};
+
+/**
+ * The students page's roster: every enrolled student with progress, best score
+ * per quiz and last activity, from a fixed number of queries however many
+ * students are enrolled. The caller checks the viewer may see `courseId`.
+ */
+export function getCourseStudentsWithActivity(
+  courseId: number
+): CourseStudentsWithActivity {
+  const roster = db
+    .select({
+      userId: enrollments.userId,
+      name: users.name,
+      email: users.email,
+      enrolledAt: enrollments.enrolledAt,
+      completedAt: enrollments.completedAt,
+    })
+    .from(enrollments)
+    .innerJoin(users, eq(users.id, enrollments.userId))
+    .where(eq(enrollments.courseId, courseId))
+    .orderBy(asc(enrollments.id))
+    .all();
+
+  const lastActivity = getLastActivityByUser(courseId);
+  const lessonCount = getLessonsInCourseOrder(courseId).length;
+  const completedByUser = getCompletedLessonIdsByUser(courseId);
+
+  const courseQuizzes = db
+    .select({
+      quizId: quizzes.id,
+      quizTitle: quizzes.title,
+      lessonTitle: lessons.title,
+    })
+    .from(quizzes)
+    .innerJoin(lessons, eq(lessons.id, quizzes.lessonId))
+    .innerJoin(modules, eq(modules.id, lessons.moduleId))
+    .where(eq(modules.courseId, courseId))
+    .orderBy(asc(modules.position), asc(lessons.position), asc(quizzes.id))
+    .all();
+
+  const bestAttempts = getBestQuizAttempts(courseId);
+
+  return {
+    students: roster.map((student) => {
+      const completed = completedByUser.get(student.userId)?.size ?? 0;
+      return {
+        ...student,
+        progress:
+          lessonCount === 0 ? 0 : Math.round((completed / lessonCount) * 100),
+        quizScores: courseQuizzes.map((quiz) => {
+          const best = bestAttempts.get(`${student.userId}:${quiz.quizId}`);
+          return {
+            ...quiz,
+            bestScore: best?.score ?? null,
+            passed: best?.passed ?? null,
+          };
+        }),
+        lastActivityAt: lastActivity.get(student.userId) ?? null,
+      };
+    }),
+    quizCount: courseQuizzes.length,
+  };
+}
+
+/** The course's lessons in course order: module position, then lesson position. */
+function getLessonsInCourseOrder(courseId: number) {
+  return db
+    .select({ id: lessons.id, title: lessons.title })
+    .from(lessons)
+    .innerJoin(modules, eq(modules.id, lessons.moduleId))
+    .where(eq(modules.courseId, courseId))
+    .orderBy(asc(modules.position), asc(lessons.position), asc(lessons.id))
+    .all();
+}
+
+/** Ids of the lessons each student has completed in `courseId`. */
+function getCompletedLessonIdsByUser(courseId: number) {
+  const rows = db
+    .select({ userId: lessonProgress.userId, lessonId: lessonProgress.lessonId })
+    .from(lessonProgress)
+    .innerJoin(lessons, eq(lessons.id, lessonProgress.lessonId))
+    .innerJoin(modules, eq(modules.id, lessons.moduleId))
+    .where(
+      and(
+        eq(modules.courseId, courseId),
+        eq(lessonProgress.status, LessonProgressStatus.Completed)
+      )
+    )
+    .all();
+
+  const byUser = new Map<number, Set<number>>();
+  for (const row of rows) {
+    let set = byUser.get(row.userId);
+    if (!set) byUser.set(row.userId, (set = new Set()));
+    set.add(row.lessonId);
+  }
+  return byUser;
+}
+
+/**
+ * Each student's highest-scoring attempt per quiz in `courseId`, keyed
+ * `${userId}:${quizId}`. Ties go to the earlier attempt.
+ */
+function getBestQuizAttempts(courseId: number) {
+  const ranked = db
+    .select({
+      userId: quizAttempts.userId,
+      quizId: quizAttempts.quizId,
+      score: quizAttempts.score,
+      passed: quizAttempts.passed,
+      attemptRank: sql<number>`row_number() over (partition by ${quizAttempts.userId}, ${quizAttempts.quizId} order by ${quizAttempts.score} desc, ${quizAttempts.id})`.as(
+        "attempt_rank"
+      ),
+    })
+    .from(quizAttempts)
+    .innerJoin(quizzes, eq(quizzes.id, quizAttempts.quizId))
+    .innerJoin(lessons, eq(lessons.id, quizzes.lessonId))
+    .innerJoin(modules, eq(modules.id, lessons.moduleId))
+    .where(eq(modules.courseId, courseId))
+    .as("ranked_best_attempts");
+
+  const rows = db
+    .select({
+      userId: ranked.userId,
+      quizId: ranked.quizId,
+      score: ranked.score,
+      passed: ranked.passed,
+    })
+    .from(ranked)
+    .where(eq(ranked.attemptRank, 1))
+    .all();
+
+  return new Map(rows.map((row) => [`${row.userId}:${row.quizId}`, row]));
+}
+
+// ─── Drop-off ───
+
+/** Days without activity after which a student who hasn't completed has dropped off. */
+export const DROP_OFF_INACTIVE_DAYS = 14;
+const DROP_OFF_LESSON_LIMIT = 3;
+
+/** A lesson where `students` dropped-off students stopped. */
+export type DropOffLesson = {
+  lessonId: number;
+  lessonTitle: string;
+  students: number;
+};
+
+/**
+ * Top lessons where students dropped off, most students first (ties in course
+ * order). A student has dropped off when their enrollment isn't complete and
+ * their last activity (or, with none, their enrollment date) is
+ * DROP_OFF_INACTIVE_DAYS or more before `now`. They stopped at the lesson after
+ * their furthest completed lesson in course order; with none completed, at the
+ * first lesson. When that furthest lesson is the last one but gaps remain, they
+ * stopped at the first lesson they haven't completed.
+ */
+function getDropOffLessons(courseId: number, now: Date): DropOffLesson[] {
+  const courseLessons = getLessonsInCourseOrder(courseId);
+  if (courseLessons.length === 0) return [];
+
+  const cutoff = new Date(
+    now.getTime() - DROP_OFF_INACTIVE_DAYS * DAY_MS
+  ).toISOString();
+  const incomplete = db
+    .select({ userId: enrollments.userId, enrolledAt: enrollments.enrolledAt })
+    .from(enrollments)
+    .where(
+      and(eq(enrollments.courseId, courseId), isNull(enrollments.completedAt))
+    )
+    .all();
+  const lastActivity = getLastActivityByUser(courseId);
+  const completedByUser = getCompletedLessonIdsByUser(courseId);
+
+  const countsByIndex = new Map<number, number>();
+  for (const student of incomplete) {
+    const last = lastActivity.get(student.userId) ?? student.enrolledAt;
+    if (last > cutoff) continue;
+
+    const completed = completedByUser.get(student.userId) ?? new Set<number>();
+    let furthest = -1;
+    courseLessons.forEach((lesson, i) => {
+      if (completed.has(lesson.id)) furthest = i;
+    });
+    let index = furthest + 1;
+    if (index >= courseLessons.length) {
+      index = courseLessons.findIndex((lesson) => !completed.has(lesson.id));
+      if (index === -1) continue; // every lesson done; nowhere to stop
+    }
+    countsByIndex.set(index, (countsByIndex.get(index) ?? 0) + 1);
+  }
+
+  return [...countsByIndex.entries()]
+    .sort(([indexA, a], [indexB, b]) => b - a || indexA - indexB)
+    .slice(0, DROP_OFF_LESSON_LIMIT)
+    .map(([index, students]) => ({
+      lessonId: courseLessons[index].id,
+      lessonTitle: courseLessons[index].title,
+      students,
+    }));
 }
