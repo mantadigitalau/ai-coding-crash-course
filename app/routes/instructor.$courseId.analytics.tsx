@@ -4,6 +4,7 @@ import { getCourseById } from "~/services/courseService";
 import {
   getCourseAnalytics,
   type CourseMetrics,
+  type QuizInsights,
   type RevenueBreakdown,
   type TeamSeats,
 } from "~/services/instructorAnalyticsService";
@@ -240,6 +241,102 @@ function TeamSeatsSection({ seats }: { seats: TeamSeats }) {
   );
 }
 
+function QuizInsightsSection({ insights }: { insights: QuizInsights }) {
+  const th =
+    "px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground";
+  return (
+    <SectionCard
+      title="Quiz insights"
+      description="How students do on each quiz, and the questions they find hardest"
+    >
+      {insights.quizzes.length === 0 ? (
+        <p className="text-sm text-muted-foreground">This course has no quizzes</p>
+      ) : (
+        <div className="space-y-6">
+          <div className="overflow-x-auto rounded-md border border-border">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-border bg-muted/50">
+                  <th className={th}>Quiz</th>
+                  <th className={th}>First-attempt avg</th>
+                  <th className={th}>First-attempt pass</th>
+                  <th className={th}>Eventual pass</th>
+                </tr>
+              </thead>
+              <tbody>
+                {insights.quizzes.map((quiz) => (
+                  <tr
+                    key={quiz.quizId}
+                    className="border-b border-border last:border-0"
+                  >
+                    <td className="px-4 py-3 font-medium">{quiz.title}</td>
+                    <td className="px-4 py-3 tabular-nums">
+                      {formatQuizScore(quiz.firstAttemptScore.average)}
+                      {quiz.firstAttemptScore.count > 0 && (
+                        <span className="ml-2 text-muted-foreground">
+                          {plural(quiz.firstAttemptScore.count, "student")}
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 tabular-nums">
+                      {formatShare(
+                        quiz.firstAttemptPass.rate,
+                        quiz.firstAttemptPass.passed,
+                        quiz.firstAttemptPass.attempted
+                      )}
+                    </td>
+                    <td className="px-4 py-3 tabular-nums">
+                      {formatShare(
+                        quiz.eventualPass.rate,
+                        quiz.eventualPass.passed,
+                        quiz.eventualPass.attempted
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div>
+            <h3 className="mb-2 text-sm font-medium">Hardest questions</h3>
+            {insights.hardestQuestions.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                No question has 5 or more answers yet
+              </p>
+            ) : (
+              <ol className="divide-y divide-border">
+                {insights.hardestQuestions.map((q) => (
+                  <li key={q.questionId} className="py-3 text-sm">
+                    <div className="flex items-baseline justify-between gap-4">
+                      <div>
+                        <p className="text-xs text-muted-foreground">
+                          {q.quizTitle}
+                        </p>
+                        <p className="font-medium">{q.questionText}</p>
+                      </div>
+                      <span className="shrink-0 tabular-nums">
+                        {formatShare(q.correctRate, q.correct, q.answers)}{" "}
+                        <span className="text-muted-foreground">correct</span>
+                      </span>
+                    </div>
+                    <p className="mt-1 text-muted-foreground">
+                      {plural(q.answers, "answer")} · most common wrong answer:{" "}
+                      <span className="text-foreground">
+                        {q.mostCommonWrongOption ?? "—"}
+                      </span>
+                    </p>
+                  </li>
+                ))}
+              </ol>
+            )}
+          </div>
+        </div>
+      )}
+    </SectionCard>
+  );
+}
+
 function SectionSkeleton() {
   return (
     <Card>
@@ -272,6 +369,7 @@ export function HydrateFallback() {
         ))}
       </div>
       <div className="space-y-6">
+        <SectionSkeleton />
         <SectionSkeleton />
         <SectionSkeleton />
       </div>
@@ -313,6 +411,7 @@ export default function CourseAnalytics({ loaderData }: Route.ComponentProps) {
         <HeadlineStats headline={headline} />
         <RevenueSection revenue={revenue} totalCents={headline.revenueCents} />
         <TeamSeatsSection seats={seats} />
+        <QuizInsightsSection insights={loaderData.quizInsights} />
       </div>
     </div>
   );
