@@ -74,3 +74,26 @@ export function formatDuration(
   }
   return `${mStr}m`;
 }
+
+/** Placeholder for a metric that can't be computed (no data). */
+export const NO_VALUE = "—";
+
+const usdFormatter = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+});
+
+/** Money from cents as USD — "$1,234.50". Unlike formatPrice, 0 is "$0.00". */
+export function formatUsd(cents: number): string {
+  return usdFormatter.format(cents / 100);
+}
+
+/** A 0..1 share as a whole percent with its counts — "67% · 4/6", or "—". */
+export function formatShare(
+  rate: number | null,
+  numerator: number,
+  denominator: number
+): string {
+  if (rate === null) return NO_VALUE;
+  return `${Math.round(rate * 100)}% · ${numerator}/${denominator}`;
+}
