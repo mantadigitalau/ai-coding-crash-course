@@ -4,7 +4,8 @@ import { getCourseById } from "~/services/courseService";
 import { getUserById } from "~/services/userService";
 import { getCourseStudentsWithActivity } from "~/services/instructorAnalyticsService";
 import { getCurrentUserId } from "~/lib/session";
-import { formatRelativeTime } from "~/lib/utils";
+import { formatRelativeTime, NO_VALUE } from "~/lib/utils";
+import { TableHeaderCell } from "~/components/table-header-cell";
 import { UserRole } from "~/db/schema";
 import { Card, CardContent } from "~/components/ui/card";
 import { Button } from "~/components/ui/button";
@@ -76,7 +77,7 @@ function progressBar(progress: number) {
 function quizScoreBadge(score: number | null, passed: boolean | null) {
   if (score === null) {
     return (
-      <span className="text-xs text-muted-foreground">—</span>
+      <span className="text-xs text-muted-foreground">{NO_VALUE}</span>
     );
   }
 
@@ -123,12 +124,7 @@ export function HydrateFallback() {
               <thead>
                 <tr className="border-b border-border bg-muted/50">
                   {SKELETON_COLUMNS.map((column) => (
-                    <th
-                      key={column}
-                      className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground"
-                    >
-                      {column}
-                    </th>
+                    <TableHeaderCell key={column}>{column}</TableHeaderCell>
                   ))}
                 </tr>
               </thead>
@@ -219,26 +215,14 @@ export default function InstructorStudentRoster({
               <table className="w-full">
                 <thead>
                   <tr className="border-b border-border bg-muted/50">
-                    <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                      Student
-                    </th>
-                    <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                      Enrolled
-                    </th>
-                    <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                      Progress
-                    </th>
-                    <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                      Status
-                    </th>
+                    <TableHeaderCell>Student</TableHeaderCell>
+                    <TableHeaderCell>Enrolled</TableHeaderCell>
+                    <TableHeaderCell>Progress</TableHeaderCell>
+                    <TableHeaderCell>Status</TableHeaderCell>
                     {quizCount > 0 && (
-                      <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                        Quiz Scores
-                      </th>
+                      <TableHeaderCell>Quiz Scores</TableHeaderCell>
                     )}
-                    <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                      Last activity
-                    </th>
+                    <TableHeaderCell>Last activity</TableHeaderCell>
                   </tr>
                 </thead>
                 <tbody>
@@ -313,7 +297,7 @@ export default function InstructorStudentRoster({
                         >
                           {student.lastActivityAt
                             ? formatRelativeTime(student.lastActivityAt)
-                            : "—"}
+                            : NO_VALUE}
                         </td>
                       </tr>
                     );

@@ -108,7 +108,7 @@ export function formatRating(average: number | null): string {
   return average === null ? NO_VALUE : `${average.toFixed(1)} ★`;
 }
 
-/** "1 rating", "3 ratings". */
-export function plural(count: number, word: string): string {
+/** A count with its noun, pluralised — "1 rating", "3 ratings". */
+export function formatCount(count: number, word: string): string {
   return `${count} ${word}${count === 1 ? "" : "s"}`;
 }

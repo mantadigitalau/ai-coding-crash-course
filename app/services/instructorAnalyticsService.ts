@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
 import { db } from "~/db";
 import {
   coupons,
@@ -20,6 +20,7 @@ import {
   type CourseStatus,
 } from "~/db/schema";
 import { getDiscountForCountry } from "~/lib/ppp";
+import { progressPercent } from "~/services/progressService";
 
 // ─── Instructor Analytics Service ───
 // Owns every instructor analytics definition (students, revenue, completion,
@@ -136,27 +137,70 @@ function toMetrics(sums: MetricSums): CourseMetrics {
 }
 
 /**
- * Each student's first attempt at each quiz in `courseIds`, as a subquery with
- * `courseId`, `quizId`, `userId`, `score` and `passed`. "First" is the earliest
- * `attemptedAt`, ties broken by id.
+ * Every quiz in `courseIds` with the course it belongs to (quiz → lesson →
+ * module), as a subquery. The one place the quiz-to-course join lives; the
+ * positions and lesson title are there for course ordering and display.
  */
-function firstQuizAttempts(courseIds: number[]) {
+function quizzesInCourses(courseIds: number[]) {
+  return db
+    .select({
+      quizId: quizzes.id,
+      quizTitle: sql<string>`${quizzes.title}`.as("quiz_title"),
+      lessonTitle: sql<string>`${lessons.title}`.as("lesson_title"),
+      courseId: modules.courseId,
+      modulePosition: sql<number>`${modules.position}`.as("module_position"),
+      lessonPosition: sql<number>`${lessons.position}`.as("lesson_position"),
+    })
+    .from(quizzes)
+    .innerJoin(lessons, eq(lessons.id, quizzes.lessonId))
+    .innerJoin(modules, eq(modules.id, lessons.moduleId))
+    .where(inArray(modules.courseId, courseIds))
+    .as("course_quizzes");
+}
+
+/** The course's quizzes in course order: module, lesson, then quiz id. */
+function getCourseQuizzesInOrder(courseId: number) {
+  const courseQuizzes = quizzesInCourses([courseId]);
+  return db
+    .select({
+      quizId: courseQuizzes.quizId,
+      quizTitle: courseQuizzes.quizTitle,
+      lessonTitle: courseQuizzes.lessonTitle,
+    })
+    .from(courseQuizzes)
+    .orderBy(
+      asc(courseQuizzes.modulePosition),
+      asc(courseQuizzes.lessonPosition),
+      asc(courseQuizzes.quizId)
+    )
+    .all();
+}
+
+/** Earliest attempt first, ties broken by id. */
+const FIRST_ATTEMPT = sql`${quizAttempts.attemptedAt}, ${quizAttempts.id}`;
+/** Highest score first, ties going to the earlier attempt. */
+const BEST_ATTEMPT = sql`${quizAttempts.score} desc, ${quizAttempts.id}`;
+
+/**
+ * One attempt per student per quiz in `courseIds` — the one that sorts first
+ * under `attemptOrder` — as a subquery with `courseId`, `quizId`, `userId`,
+ * `score` and `passed`.
+ */
+function pickQuizAttempts(courseIds: number[], attemptOrder: SQL) {
+  const courseQuizzes = quizzesInCourses(courseIds);
   const ranked = db
     .select({
-      courseId: modules.courseId,
+      courseId: courseQuizzes.courseId,
       quizId: quizAttempts.quizId,
       userId: quizAttempts.userId,
       score: quizAttempts.score,
       passed: quizAttempts.passed,
-      attemptRank: sql<number>`row_number() over (partition by ${quizAttempts.userId}, ${quizAttempts.quizId} order by ${quizAttempts.attemptedAt}, ${quizAttempts.id})`.as(
+      attemptRank: sql<number>`row_number() over (partition by ${quizAttempts.userId}, ${quizAttempts.quizId} order by ${attemptOrder})`.as(
         "attempt_rank"
       ),
     })
     .from(quizAttempts)
-    .innerJoin(quizzes, eq(quizzes.id, quizAttempts.quizId))
-    .innerJoin(lessons, eq(lessons.id, quizzes.lessonId))
-    .innerJoin(modules, eq(modules.id, lessons.moduleId))
-    .where(inArray(modules.courseId, courseIds))
+    .innerJoin(courseQuizzes, eq(courseQuizzes.quizId, quizAttempts.quizId))
     .as("ranked_attempts");
 
   return db
@@ -169,7 +213,7 @@ function firstQuizAttempts(courseIds: number[]) {
     })
     .from(ranked)
     .where(eq(ranked.attemptRank, 1))
-    .as("first_attempts");
+    .as("picked_attempts");
 }
 
 /**
@@ -224,7 +268,7 @@ function getMetricSumsByCourse(
     s.revenueRecentCents = row.revenueRecentCents;
   }
 
-  const firstAttempts = firstQuizAttempts(courseIds);
+  const firstAttempts = pickQuizAttempts(courseIds, FIRST_ATTEMPT);
   const quizRows = db
     .select({
       courseId: firstAttempts.courseId,
@@ -322,6 +366,8 @@ export type RevenueBreakdown = {
  * A purchase is a team purchase when team seat coupons are attached to it.
  * It is PPP when the course has PPP enabled and the purchase's stored country
  * gets a discount; otherwise (including no country) it is full price.
+ * Purchases record only `amountPaid` and `country` — not the list price or the
+ * discount applied — so the discount is inferred from the country.
  */
 function getRevenueBreakdown(
   courseId: number,
@@ -448,16 +494,9 @@ function passRate(passed: number, attempted: number): PassRate {
 }
 
 function getQuizInsights(courseId: number): QuizInsights {
-  const courseQuizzes = db
-    .select({ id: quizzes.id, title: quizzes.title })
-    .from(quizzes)
-    .innerJoin(lessons, eq(lessons.id, quizzes.lessonId))
-    .innerJoin(modules, eq(modules.id, lessons.moduleId))
-    .where(eq(modules.courseId, courseId))
-    .orderBy(asc(modules.position), asc(lessons.position), asc(quizzes.id))
-    .all();
+  const courseQuizzes = getCourseQuizzesInOrder(courseId);
 
-  const firstAttempts = firstQuizAttempts([courseId]);
+  const firstAttempts = pickQuizAttempts([courseId], FIRST_ATTEMPT);
   const firstRows = db
     .select({
       quizId: firstAttempts.quizId,
@@ -470,7 +509,7 @@ function getQuizInsights(courseId: number): QuizInsights {
     .all();
   const firstByQuiz = new Map(firstRows.map((r) => [r.quizId, r]));
 
-  const quizIds = courseQuizzes.map((q) => q.id);
+  const quizIds = courseQuizzes.map((q) => q.quizId);
   const eventualRows =
     quizIds.length === 0
       ? []
@@ -488,12 +527,12 @@ function getQuizInsights(courseId: number): QuizInsights {
 
   return {
     quizzes: courseQuizzes.map((quiz) => {
-      const first = firstByQuiz.get(quiz.id);
-      const eventual = eventualByQuiz.get(quiz.id);
+      const first = firstByQuiz.get(quiz.quizId);
+      const eventual = eventualByQuiz.get(quiz.quizId);
       const attempted = first?.attempted ?? 0;
       return {
-        quizId: quiz.id,
-        title: quiz.title,
+        quizId: quiz.quizId,
+        title: quiz.quizTitle,
         firstAttemptScore: {
           average: attempted === 0 ? null : first!.scoreSum / attempted,
           count: attempted,
@@ -590,6 +629,7 @@ type LastActivity = Map<number, string>;
  * within `courseId`. ISO strings compare correctly as text.
  */
 function getLastActivityByUser(courseId: number): LastActivity {
+  const courseQuizzes = quizzesInCourses([courseId]);
   const lessonCompletions = db
     .select({
       userId: lessonProgress.userId,
@@ -607,10 +647,7 @@ function getLastActivityByUser(courseId: number): LastActivity {
       at: sql<string | null>`max(${quizAttempts.attemptedAt})`,
     })
     .from(quizAttempts)
-    .innerJoin(quizzes, eq(quizzes.id, quizAttempts.quizId))
-    .innerJoin(lessons, eq(lessons.id, quizzes.lessonId))
-    .innerJoin(modules, eq(modules.id, lessons.moduleId))
-    .where(eq(modules.courseId, courseId))
+    .innerJoin(courseQuizzes, eq(courseQuizzes.quizId, quizAttempts.quizId))
     .groupBy(quizAttempts.userId)
     .all();
   const videoWatchTimes = db
@@ -693,18 +730,7 @@ export function getCourseStudentsWithActivity(
   const lessonCount = getLessonsInCourseOrder(courseId).length;
   const completedByUser = getCompletedLessonIdsByUser(courseId);
 
-  const courseQuizzes = db
-    .select({
-      quizId: quizzes.id,
-      quizTitle: quizzes.title,
-      lessonTitle: lessons.title,
-    })
-    .from(quizzes)
-    .innerJoin(lessons, eq(lessons.id, quizzes.lessonId))
-    .innerJoin(modules, eq(modules.id, lessons.moduleId))
-    .where(eq(modules.courseId, courseId))
-    .orderBy(asc(modules.position), asc(lessons.position), asc(quizzes.id))
-    .all();
+  const courseQuizzes = getCourseQuizzesInOrder(courseId);
 
   const bestAttempts = getBestQuizAttempts(courseId);
 
@@ -713,8 +739,7 @@ export function getCourseStudentsWithActivity(
       const completed = completedByUser.get(student.userId)?.size ?? 0;
       return {
         ...student,
-        progress:
-          lessonCount === 0 ? 0 : Math.round((completed / lessonCount) * 100),
+        progress: progressPercent(completed, lessonCount),
         quizScores: courseQuizzes.map((quiz) => {
           const best = bestAttempts.get(`${student.userId}:${quiz.quizId}`);
           return {
@@ -770,34 +795,10 @@ function getCompletedLessonIdsByUser(courseId: number) {
  * `${userId}:${quizId}`. Ties go to the earlier attempt.
  */
 function getBestQuizAttempts(courseId: number) {
-  const ranked = db
-    .select({
-      userId: quizAttempts.userId,
-      quizId: quizAttempts.quizId,
-      score: quizAttempts.score,
-      passed: quizAttempts.passed,
-      attemptRank: sql<number>`row_number() over (partition by ${quizAttempts.userId}, ${quizAttempts.quizId} order by ${quizAttempts.score} desc, ${quizAttempts.id})`.as(
-        "attempt_rank"
-      ),
-    })
-    .from(quizAttempts)
-    .innerJoin(quizzes, eq(quizzes.id, quizAttempts.quizId))
-    .innerJoin(lessons, eq(lessons.id, quizzes.lessonId))
-    .innerJoin(modules, eq(modules.id, lessons.moduleId))
-    .where(eq(modules.courseId, courseId))
-    .as("ranked_best_attempts");
-
   const rows = db
-    .select({
-      userId: ranked.userId,
-      quizId: ranked.quizId,
-      score: ranked.score,
-      passed: ranked.passed,
-    })
-    .from(ranked)
-    .where(eq(ranked.attemptRank, 1))
+    .select()
+    .from(pickQuizAttempts([courseId], BEST_ATTEMPT))
     .all();
-
   return new Map(rows.map((row) => [`${row.userId}:${row.quizId}`, row]));
 }
 
