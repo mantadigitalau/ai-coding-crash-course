@@ -1,19 +1,16 @@
 import { Link } from "react-router";
 import type { Route } from "./+types/instructor.$courseId.students";
 import { getCourseById } from "~/services/courseService";
-import { getCourseEnrolledStudents } from "~/services/enrollmentService";
 import { getUserById } from "~/services/userService";
-import { calculateProgress } from "~/services/progressService";
-import { getQuizByLessonId, getBestAttempt } from "~/services/quizService";
+import { getCourseStudentsWithActivity } from "~/services/instructorAnalyticsService";
 import { getCurrentUserId } from "~/lib/session";
+import { formatRelativeTime } from "~/lib/utils";
 import { UserRole } from "~/db/schema";
 import { Card, CardContent } from "~/components/ui/card";
 import { Button } from "~/components/ui/button";
+import { Skeleton } from "~/components/ui/skeleton";
 import { AlertTriangle, ArrowLeft, Users, Award } from "lucide-react";
 import { data, isRouteErrorResponse } from "react-router";
-import { db } from "~/db";
-import { modules, lessons } from "~/db/schema";
-import { eq } from "drizzle-orm";
 
 export function meta({ loaderData }: Route.MetaArgs) {
   const title = loaderData?.course?.title ?? "Student Roster";
@@ -57,70 +54,9 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     });
   }
 
-  // Get all enrolled students
-  const enrolledStudents = getCourseEnrolledStudents(courseId);
+  const { students, quizCount } = getCourseStudentsWithActivity(courseId);
 
-  // Get all lessons with quizzes for this course
-  const courseModules = db
-    .select({ id: modules.id })
-    .from(modules)
-    .where(eq(modules.courseId, courseId))
-    .all();
-
-  // Get all lessons across all modules
-  const allCourseLessons: { id: number; title: string }[] = [];
-  for (const mod of courseModules) {
-    const modLessons = db
-      .select({ id: lessons.id, title: lessons.title })
-      .from(lessons)
-      .where(eq(lessons.moduleId, mod.id))
-      .all();
-    allCourseLessons.push(...modLessons);
-  }
-
-  // Find which lessons have quizzes
-  const lessonQuizzes: { lessonId: number; lessonTitle: string; quizId: number; quizTitle: string }[] = [];
-  for (const lesson of allCourseLessons) {
-    const quiz = getQuizByLessonId(lesson.id);
-    if (quiz) {
-      lessonQuizzes.push({
-        lessonId: lesson.id,
-        lessonTitle: lesson.title,
-        quizId: quiz.id,
-        quizTitle: quiz.title,
-      });
-    }
-  }
-
-  // Build student data with progress and quiz scores
-  const students = enrolledStudents.map((enrollment) => {
-    const studentUser = getUserById(enrollment.userId);
-    const progress = calculateProgress(enrollment.userId, courseId, false, false);
-
-    // Get best quiz attempt for each quiz in this course
-    const quizScores = lessonQuizzes.map((lq) => {
-      const bestAttempt = getBestAttempt(enrollment.userId, lq.quizId);
-      return {
-        quizId: lq.quizId,
-        quizTitle: lq.quizTitle,
-        lessonTitle: lq.lessonTitle,
-        bestScore: bestAttempt?.score ?? null,
-        passed: bestAttempt?.passed ?? null,
-      };
-    });
-
-    return {
-      userId: enrollment.userId,
-      name: studentUser?.name ?? "Unknown",
-      email: studentUser?.email ?? "",
-      enrolledAt: enrollment.enrolledAt,
-      completedAt: enrollment.completedAt,
-      progress,
-      quizScores,
-    };
-  });
-
-  return { course, students, quizCount: lessonQuizzes.length };
+  return { course, students, quizCount };
 }
 
 function progressBar(progress: number) {
@@ -158,6 +94,60 @@ function quizScoreBadge(score: number | null, passed: boolean | null) {
     <span className="inline-flex items-center rounded-full bg-red-100 px-2 py-0.5 text-xs font-medium text-red-800 dark:bg-red-900/30 dark:text-red-400">
       {percentage}%
     </span>
+  );
+}
+
+const SKELETON_COLUMNS = [
+  "Student",
+  "Enrolled",
+  "Progress",
+  "Status",
+  "Quiz Scores",
+  "Last activity",
+];
+
+export function HydrateFallback() {
+  return (
+    <div className="mx-auto max-w-7xl p-6 lg:p-8">
+      <Skeleton className="mb-6 h-5 w-64" />
+      <Skeleton className="mb-4 h-5 w-40" />
+      <div className="mb-8">
+        <Skeleton className="h-9 w-56" />
+        <Skeleton className="mt-2 h-5 w-80" />
+      </div>
+      <Skeleton className="mb-4 h-5 w-48" />
+      <Card>
+        <CardContent className="p-0">
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead>
+                <tr className="border-b border-border bg-muted/50">
+                  {SKELETON_COLUMNS.map((column) => (
+                    <th
+                      key={column}
+                      className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground"
+                    >
+                      {column}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {Array.from({ length: 8 }).map((_, i) => (
+                  <tr key={i} className="border-b border-border last:border-0">
+                    {SKELETON_COLUMNS.map((column) => (
+                      <td key={column} className="px-4 py-3">
+                        <Skeleton className="h-4 w-24" />
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
   );
 }
 
@@ -246,6 +236,9 @@ export default function InstructorStudentRoster({
                         Quiz Scores
                       </th>
                     )}
+                    <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground">
+                      Last activity
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -309,6 +302,19 @@ export default function InstructorStudentRoster({
                             </div>
                           </td>
                         )}
+                        <td
+                          className="px-4 py-3 text-sm text-muted-foreground"
+                          title={
+                            student.lastActivityAt
+                              ? new Date(student.lastActivityAt).toLocaleString()
+                              : undefined
+                          }
+                          suppressHydrationWarning
+                        >
+                          {student.lastActivityAt
+                            ? formatRelativeTime(student.lastActivityAt)
+                            : "—"}
+                        </td>
                       </tr>
                     );
                   })}
