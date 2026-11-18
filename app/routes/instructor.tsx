@@ -1,16 +1,25 @@
 import { Link } from "react-router";
 import type { Route } from "./+types/instructor";
-import { getCoursesByInstructor, getLessonCountForCourse } from "~/services/courseService";
-import { getEnrollmentCountForCourse } from "~/services/enrollmentService";
+import { getInstructorDashboard } from "~/services/instructorAnalyticsService";
 import { getCurrentUserId } from "~/lib/session";
 import { getUserById } from "~/services/userService";
-import { Card, CardContent, CardFooter, CardHeader } from "~/components/ui/card";
+import { Card, CardContent, CardHeader } from "~/components/ui/card";
 import { Button } from "~/components/ui/button";
 import { Skeleton } from "~/components/ui/skeleton";
-import { AlertTriangle, BookOpen, GraduationCap, Plus, Users } from "lucide-react";
-import { CourseImage } from "~/components/course-image";
+import {
+  AlertTriangle,
+  BarChart3,
+  CheckCircle2,
+  DollarSign,
+  GraduationCap,
+  Pencil,
+  Plus,
+  Star,
+  Users,
+} from "lucide-react";
 import { data, isRouteErrorResponse } from "react-router";
 import { CourseStatus, UserRole } from "~/db/schema";
+import { formatShare, formatUsd, NO_VALUE } from "~/lib/utils";
 
 export function meta() {
   return [
@@ -36,27 +45,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     });
   }
 
-  const instructorCourses = getCoursesByInstructor(currentUserId);
-
-  const coursesWithStats = instructorCourses.map((course) => {
-    const lessonCount = getLessonCountForCourse(course.id);
-    const enrollmentCount = getEnrollmentCountForCourse(course.id);
-
-    return {
-      id: course.id,
-      title: course.title,
-      slug: course.slug,
-      description: course.description,
-      status: course.status,
-      coverImageUrl: course.coverImageUrl,
-      lessonCount,
-      enrollmentCount,
-      createdAt: course.createdAt,
-      updatedAt: course.updatedAt,
-    };
-  });
-
-  return { courses: coursesWithStats };
+  return getInstructorDashboard(currentUserId);
 }
 
 function statusBadge(status: string) {
@@ -84,6 +73,101 @@ function statusBadge(status: string) {
   }
 }
 
+const TH_CLASS =
+  "px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground";
+
+const COLUMNS = [
+  "Course",
+  "Students",
+  "Revenue",
+  "Completion",
+  "Avg quiz score",
+  "Rating",
+  "Actions",
+];
+
+function formatQuizScore(average: number | null): string {
+  return average === null ? NO_VALUE : `${Math.round(average * 100)}%`;
+}
+
+function formatRating(average: number | null): string {
+  return average === null ? NO_VALUE : `${average.toFixed(1)} ★`;
+}
+
+function plural(count: number, word: string) {
+  return `${count} ${word}${count === 1 ? "" : "s"}`;
+}
+
+function StatCard({
+  label,
+  value,
+  detail,
+  icon: Icon,
+}: {
+  label: string;
+  value: string;
+  detail: string;
+  icon: typeof Users;
+}) {
+  return (
+    <Card className="gap-2">
+      <CardHeader className="flex flex-row items-center justify-between">
+        <span className="text-sm font-medium text-muted-foreground">
+          {label}
+        </span>
+        <Icon className="size-4 text-muted-foreground" />
+      </CardHeader>
+      <CardContent>
+        <div className="text-2xl font-bold tabular-nums">{value}</div>
+        <p className="mt-1 text-xs text-muted-foreground">{detail}</p>
+      </CardContent>
+    </Card>
+  );
+}
+
+function StatCardSkeleton() {
+  return (
+    <Card className="gap-2">
+      <CardHeader className="flex flex-row items-center justify-between">
+        <Skeleton className="h-4 w-24" />
+        <Skeleton className="size-4" />
+      </CardHeader>
+      <CardContent>
+        <Skeleton className="h-8 w-20" />
+        <Skeleton className="mt-2 h-3 w-28" />
+      </CardContent>
+    </Card>
+  );
+}
+
+function TableRowSkeleton() {
+  return (
+    <tr className="border-b border-border last:border-0">
+      <td className="px-4 py-3"><Skeleton className="h-4 w-48" /></td>
+      <td className="px-4 py-3"><Skeleton className="h-4 w-10" /></td>
+      <td className="px-4 py-3"><Skeleton className="h-4 w-20" /></td>
+      <td className="px-4 py-3"><Skeleton className="h-4 w-24" /></td>
+      <td className="px-4 py-3"><Skeleton className="h-4 w-16" /></td>
+      <td className="px-4 py-3"><Skeleton className="h-4 w-16" /></td>
+      <td className="px-4 py-3"><Skeleton className="h-8 w-40" /></td>
+    </tr>
+  );
+}
+
+function CourseTableHead() {
+  return (
+    <thead>
+      <tr className="border-b border-border bg-muted/50">
+        {COLUMNS.map((column) => (
+          <th key={column} className={TH_CLASS}>
+            {column}
+          </th>
+        ))}
+      </tr>
+    </thead>
+  );
+}
+
 export function HydrateFallback() {
   return (
     <div className="mx-auto max-w-7xl p-6 lg:p-8">
@@ -94,26 +178,25 @@ export function HydrateFallback() {
         </div>
         <Skeleton className="h-10 w-32" />
       </div>
-      <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-        {Array.from({ length: 3 }).map((_, i) => (
-          <Card key={i} className="flex flex-col">
-            <Skeleton className="aspect-video rounded-b-none rounded-t-lg" />
-            <CardHeader>
-              <Skeleton className="h-5 w-3/4" />
-              <Skeleton className="h-4 w-full" />
-            </CardHeader>
-            <CardContent className="flex-1">
-              <div className="flex items-center gap-4">
-                <Skeleton className="h-4 w-20" />
-                <Skeleton className="h-4 w-20" />
-              </div>
-            </CardContent>
-            <CardFooter>
-              <Skeleton className="h-10 w-full" />
-            </CardFooter>
-          </Card>
+      <div className="mb-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+        {Array.from({ length: 5 }).map((_, i) => (
+          <StatCardSkeleton key={i} />
         ))}
       </div>
+      <Card className="py-0">
+        <CardContent className="p-0">
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <CourseTableHead />
+              <tbody>
+                {Array.from({ length: 4 }).map((_, i) => (
+                  <TableRowSkeleton key={i} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -121,7 +204,7 @@ export function HydrateFallback() {
 export default function InstructorDashboard({
   loaderData,
 }: Route.ComponentProps) {
-  const { courses } = loaderData;
+  const { totals, courses } = loaderData;
 
   return (
     <div className="mx-auto max-w-7xl p-6 lg:p-8">
@@ -138,7 +221,7 @@ export default function InstructorDashboard({
         <div>
           <h1 className="text-3xl font-bold">My Courses</h1>
           <p className="mt-1 text-muted-foreground">
-            Manage your courses and track enrollments
+            How your courses are doing, across every course you own
           </p>
         </div>
         <Link to="/instructor/new">
@@ -164,59 +247,121 @@ export default function InstructorDashboard({
           </Link>
         </div>
       ) : (
-        <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-          {courses.map((course) => (
-            <Card key={course.id} className="flex flex-col overflow-hidden pt-0">
-              <Link to={`/courses/${course.slug}`} className="aspect-video overflow-hidden">
-                <CourseImage
-                  src={course.coverImageUrl}
-                  alt={course.title}
-                  className="h-full w-full object-cover transition-transform hover:scale-105"
-                />
-              </Link>
-              <CardHeader>
-                <div className="flex items-start justify-between gap-2">
-                  <Link
-                    to={`/courses/${course.slug}`}
-                    className="text-lg font-semibold leading-tight hover:text-primary"
-                  >
-                    {course.title}
-                  </Link>
-                  {statusBadge(course.status)}
-                </div>
-                <p className="line-clamp-2 text-sm text-muted-foreground">
-                  {course.description}
-                </p>
-              </CardHeader>
-              <CardContent className="flex-1">
-                <div className="flex items-center gap-4 text-sm text-muted-foreground">
-                  <div className="flex items-center gap-1.5">
-                    <BookOpen className="size-4" />
-                    <span>
-                      {course.lessonCount}{" "}
-                      {course.lessonCount === 1 ? "lesson" : "lessons"}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-1.5">
-                    <Users className="size-4" />
-                    <span>
-                      {course.enrollmentCount}{" "}
-                      {course.enrollmentCount === 1 ? "student" : "students"}
-                    </span>
-                  </div>
-                </div>
-              </CardContent>
-              <CardFooter>
-                <Link to={`/instructor/${course.id}`} className="w-full">
-                  <Button className="w-full" variant="outline">
-                    <BookOpen className="mr-2 size-4" />
-                    Edit Course
-                  </Button>
-                </Link>
-              </CardFooter>
-            </Card>
-          ))}
-        </div>
+        <>
+          <div className="mb-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+            <StatCard
+              label="Students"
+              icon={Users}
+              value={String(totals.students)}
+              detail={`+${totals.studentsLast30Days} in last 30 days`}
+            />
+            <StatCard
+              label="Gross revenue (USD)"
+              icon={DollarSign}
+              value={formatUsd(totals.revenueCents)}
+              detail={`+${formatUsd(totals.revenueLast30DaysCents)} in last 30 days`}
+            />
+            <StatCard
+              label="Completion rate"
+              icon={CheckCircle2}
+              value={formatShare(
+                totals.completion.rate,
+                totals.completion.completed,
+                totals.completion.enrolled
+              )}
+              detail="Completed ÷ enrolled"
+            />
+            <StatCard
+              label="Avg quiz score"
+              icon={GraduationCap}
+              value={formatQuizScore(totals.avgQuizScore.average)}
+              detail={`First attempts · ${plural(totals.avgQuizScore.count, "attempt")}`}
+            />
+            <StatCard
+              label="Avg rating"
+              icon={Star}
+              value={formatRating(totals.rating.average)}
+              detail={plural(totals.rating.count, "rating")}
+            />
+          </div>
+
+          <Card className="py-0">
+            <CardContent className="p-0">
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <CourseTableHead />
+                  <tbody>
+                    {courses.map((course) => (
+                      <tr
+                        key={course.id}
+                        className="border-b border-border last:border-0"
+                      >
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <Link
+                              to={`/courses/${course.slug}`}
+                              className="font-medium hover:text-primary"
+                            >
+                              {course.title}
+                            </Link>
+                            {statusBadge(course.status)}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-sm tabular-nums">
+                          {course.students}
+                        </td>
+                        <td className="px-4 py-3 text-sm tabular-nums">
+                          {formatUsd(course.revenueCents)}
+                        </td>
+                        <td className="px-4 py-3 text-sm tabular-nums">
+                          {formatShare(
+                            course.completion.rate,
+                            course.completion.completed,
+                            course.completion.enrolled
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-sm tabular-nums">
+                          {formatQuizScore(course.avgQuizScore.average)}
+                          {course.avgQuizScore.average !== null && (
+                            <span className="text-muted-foreground">
+                              {" "}
+                              · {plural(course.avgQuizScore.count, "attempt")}
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-sm tabular-nums">
+                          {formatRating(course.rating.average)}
+                          {course.rating.average !== null && (
+                            <span className="text-muted-foreground">
+                              {" "}
+                              · {plural(course.rating.count, "rating")}
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <Link to={`/instructor/${course.id}`}>
+                              <Button size="sm" variant="outline">
+                                <Pencil className="mr-1.5 size-3.5" />
+                                Edit
+                              </Button>
+                            </Link>
+                            <Link to={`/instructor/${course.id}/analytics`}>
+                              <Button size="sm" variant="ghost">
+                                <BarChart3 className="mr-1.5 size-3.5" />
+                                Analytics
+                              </Button>
+                            </Link>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </CardContent>
+          </Card>
+        </>
       )}
     </div>
   );
