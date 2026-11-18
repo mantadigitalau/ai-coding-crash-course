@@ -1,6 +1,7 @@
 import { asc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "~/db";
 import {
+  coupons,
   courseRatings,
   courses,
   enrollments,
@@ -11,6 +12,7 @@ import {
   quizzes,
   type CourseStatus,
 } from "~/db/schema";
+import { getDiscountForCountry } from "~/lib/ppp";
 
 // ─── Instructor Analytics Service ───
 // Owns every instructor analytics definition (students, revenue, completion,
@@ -286,4 +288,102 @@ export function getInstructorDashboard(
   });
 
   return { totals: toMetrics(totals), courses: rows };
+}
+
+/**
+ * Analytics for one course. Each section is its own top-level field, so a new
+ * section is one more field. The caller is responsible for checking the viewer
+ * may see `courseId` (owner or admin).
+ */
+export type CourseAnalytics = {
+  headline: CourseMetrics;
+  revenue: RevenueBreakdown;
+  seats: TeamSeats;
+};
+
+/** Gross revenue split two ways; each pair sums to the course's gross revenue. */
+export type RevenueBreakdown = {
+  individualCents: number;
+  teamCents: number;
+  fullPriceCents: number;
+  pppCents: number;
+};
+
+/**
+ * A purchase is a team purchase when team seat coupons are attached to it.
+ * It is PPP when the course has PPP enabled and the purchase's stored country
+ * gets a discount; otherwise (including no country) it is full price.
+ */
+function getRevenueBreakdown(
+  courseId: number,
+  pppEnabled: boolean
+): RevenueBreakdown {
+  const teamPurchaseIds = db
+    .select({ id: coupons.purchaseId })
+    .from(coupons)
+    .where(eq(coupons.courseId, courseId));
+  const isTeam = sql<number>`${inArray(purchases.id, teamPurchaseIds)}`;
+  const rows = db
+    .select({
+      isTeam,
+      country: purchases.country,
+      cents: sql<number>`coalesce(sum(${purchases.amountPaid}), 0)`,
+    })
+    .from(purchases)
+    .where(eq(purchases.courseId, courseId))
+    .groupBy(isTeam, purchases.country)
+    .all();
+
+  const breakdown: RevenueBreakdown = {
+    individualCents: 0,
+    teamCents: 0,
+    fullPriceCents: 0,
+    pppCents: 0,
+  };
+  for (const row of rows) {
+    if (row.isTeam) breakdown.teamCents += row.cents;
+    else breakdown.individualCents += row.cents;
+
+    if (pppEnabled && getDiscountForCountry(row.country) > 0) {
+      breakdown.pppCents += row.cents;
+    } else {
+      breakdown.fullPriceCents += row.cents;
+    }
+  }
+  return breakdown;
+}
+
+export function getCourseAnalytics(
+  courseId: number,
+  now: Date = new Date()
+): CourseAnalytics {
+  const course = db
+    .select({ pppEnabled: courses.pppEnabled })
+    .from(courses)
+    .where(eq(courses.id, courseId))
+    .get();
+  const sums = getMetricSumsByCourse([courseId], now).get(courseId)!;
+  return {
+    headline: toMetrics(sums),
+    revenue: getRevenueBreakdown(courseId, course?.pppEnabled ?? false),
+    seats: getTeamSeats(courseId),
+  };
+}
+
+/** Team seats: sold = coupons created for the course; redeemed = coupons with a redeemer. */
+export type TeamSeats = {
+  sold: number;
+  redeemed: number;
+};
+
+function getTeamSeats(courseId: number): TeamSeats {
+  const row = db
+    .select({
+      sold: sql<number>`count(*)`,
+      redeemed: sql<number>`count(${coupons.redeemedByUserId})`,
+    })
+    .from(coupons)
+    .where(eq(coupons.courseId, courseId))
+    .get();
+  return { sold: row?.sold ?? 0, redeemed: row?.redeemed ?? 0 };
 }
