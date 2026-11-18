@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { createTestDb, seedBaseData } from "~/test/setup";
 import * as schema from "~/db/schema";
+import { eq } from "drizzle-orm";
 
 let testDb: ReturnType<typeof createTestDb>;
 let base: ReturnType<typeof seedBaseData>;
@@ -12,7 +13,10 @@ vi.mock("~/db", () => ({
 }));
 
 // Import after mock so the module picks up our test db
-import { getInstructorDashboard } from "./instructorAnalyticsService";
+import {
+  getCourseAnalytics,
+  getInstructorDashboard,
+} from "./instructorAnalyticsService";
 
 const NOW = new Date("2026-06-01T12:00:00.000Z");
 
@@ -85,13 +89,45 @@ function purchase(
   userId: number,
   courseId: number,
   amountPaid: number,
-  createdAt: string = daysBefore(60)
+  createdAt: string = daysBefore(60),
+  country: string | null = null
 ) {
   return testDb
     .insert(schema.purchases)
-    .values({ userId, courseId, amountPaid, createdAt })
+    .values({ userId, courseId, amountPaid, createdAt, country })
     .returning()
     .get();
+}
+
+let couponCounter = 0;
+
+/** A team purchase: one purchase row plus a coupon per seat. */
+function teamPurchase(
+  buyerId: number,
+  courseId: number,
+  amountPaid: number,
+  seats: number,
+  redeemedBy: number[] = [],
+  country: string | null = null
+) {
+  const team = testDb.insert(schema.teams).values({}).returning().get();
+  const row = purchase(buyerId, courseId, amountPaid, daysBefore(20), country);
+  for (let i = 0; i < seats; i++) {
+    couponCounter++;
+    const redeemer = redeemedBy[i] ?? null;
+    testDb
+      .insert(schema.coupons)
+      .values({
+        teamId: team.id,
+        courseId,
+        code: `SEAT-${couponCounter}`,
+        purchaseId: row.id,
+        redeemedByUserId: redeemer,
+        redeemedAt: redeemer === null ? null : daysBefore(10),
+      })
+      .run();
+  }
+  return row;
 }
 
 function createQuiz(courseId: number) {
@@ -304,6 +340,118 @@ describe("instructorAnalyticsService", () => {
       });
       // (5 + 4 + 2) / 3 = 3.67, not the 3.25 average of course averages.
       expect(dashboard.totals.rating).toEqual({ average: 3.7, count: 3 });
+    });
+  });
+  describe("getCourseAnalytics", () => {
+    it("reports the same headline stats as the course's dashboard row", () => {
+      const other = createCourse("Other Course");
+      const alice = createStudent();
+      const bob = createStudent();
+      enroll(alice.id, base.course.id, daysBefore(40), daysBefore(5));
+      enroll(bob.id, base.course.id, daysBefore(10));
+      enroll(bob.id, other.id, daysBefore(10));
+      purchase(alice.id, base.course.id, 4999, daysBefore(40));
+      purchase(bob.id, base.course.id, 2500, daysBefore(10));
+      purchase(bob.id, other.id, 9999, daysBefore(10));
+      const quiz = createQuiz(base.course.id);
+      attempt(alice.id, quiz.id, 0.5, daysBefore(9));
+      attempt(alice.id, quiz.id, 1.0, daysBefore(8));
+      attempt(bob.id, quiz.id, 0.9, daysBefore(7));
+      rate(alice.id, base.course.id, 4);
+      rate(bob.id, other.id, 1);
+
+      const analytics = getCourseAnalytics(base.course.id, NOW);
+
+      expect(analytics.headline).toEqual({
+        students: 2,
+        studentsLast30Days: 1,
+        revenueCents: 7499,
+        revenueLast30DaysCents: 2500,
+        completion: { rate: 0.5, completed: 1, enrolled: 2 },
+        avgQuizScore: { average: 0.7, count: 2 },
+        rating: { average: 4, count: 1 },
+      });
+      const { id: _id, title: _t, slug: _s, status: _st, ...row } = rowFor(
+        getInstructorDashboard(base.instructor.id, NOW),
+        base.course.id
+      );
+      expect(analytics.headline).toEqual(row);
+    });
+
+    it("splits revenue into individual and team purchases", () => {
+      const buyer = createStudent();
+      purchase(buyer.id, base.course.id, 4999);
+      purchase(createStudent().id, base.course.id, 2500);
+      teamPurchase(buyer.id, base.course.id, 15000, 3);
+      // Another course's team purchase doesn't count here.
+      teamPurchase(buyer.id, createCourse("Other Course").id, 80000, 2);
+
+      const { revenue } = getCourseAnalytics(base.course.id, NOW);
+
+      expect(revenue.individualCents).toBe(7499);
+      expect(revenue.teamCents).toBe(15000);
+    });
+
+    it("splits revenue into full price and PPP by purchase country", () => {
+      const buyer = createStudent();
+      purchase(buyer.id, base.course.id, 4999, daysBefore(5), "US");
+      purchase(buyer.id, base.course.id, 3000, daysBefore(5), null);
+      purchase(buyer.id, base.course.id, 2500, daysBefore(5), "IN");
+      purchase(buyer.id, base.course.id, 1500, daysBefore(5), "ng");
+      teamPurchase(buyer.id, base.course.id, 10000, 2, [], "BR");
+
+      const { revenue, headline } = getCourseAnalytics(base.course.id, NOW);
+
+      expect(revenue.fullPriceCents).toBe(7999);
+      expect(revenue.pppCents).toBe(14000);
+      expect(revenue.fullPriceCents + revenue.pppCents).toBe(
+        headline.revenueCents
+      );
+      expect(revenue.individualCents + revenue.teamCents).toBe(
+        headline.revenueCents
+      );
+    });
+
+    it("counts every purchase as full price when the course has PPP disabled", () => {
+      const course = testDb
+        .update(schema.courses)
+        .set({ pppEnabled: false })
+        .where(eq(schema.courses.id, base.course.id))
+        .returning()
+        .get();
+      const buyer = createStudent();
+      purchase(buyer.id, course.id, 4999, daysBefore(5), "IN");
+      purchase(buyer.id, course.id, 4999, daysBefore(5), "US");
+
+      const { revenue } = getCourseAnalytics(course.id, NOW);
+
+      expect(revenue.fullPriceCents).toBe(9998);
+      expect(revenue.pppCents).toBe(0);
+    });
+
+    it("counts team seats sold and redeemed, without counting seats as students", () => {
+      const buyer = createStudent();
+      const alice = createStudent();
+      const bob = createStudent();
+      teamPurchase(buyer.id, base.course.id, 15000, 3, [alice.id]);
+      teamPurchase(buyer.id, base.course.id, 10000, 2, [bob.id]);
+      enroll(alice.id, base.course.id);
+      enroll(bob.id, base.course.id);
+      teamPurchase(buyer.id, createCourse("Other Course").id, 5000, 4, [alice.id]);
+
+      const { seats, headline } = getCourseAnalytics(base.course.id, NOW);
+
+      expect(seats).toEqual({ sold: 5, redeemed: 2 });
+      expect(headline.students).toBe(2);
+    });
+
+    it("reports zero seats when there are no team purchases", () => {
+      purchase(createStudent().id, base.course.id, 4999);
+
+      expect(getCourseAnalytics(base.course.id, NOW).seats).toEqual({
+        sold: 0,
+        redeemed: 0,
+      });
     });
   });
 });

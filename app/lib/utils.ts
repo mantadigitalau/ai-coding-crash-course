@@ -97,3 +97,18 @@ export function formatShare(
   if (rate === null) return NO_VALUE;
   return `${Math.round(rate * 100)}% · ${numerator}/${denominator}`;
 }
+
+/** A 0..1 quiz score as a whole percent — "72%", or "—". */
+export function formatQuizScore(average: number | null): string {
+  return average === null ? NO_VALUE : `${Math.round(average * 100)}%`;
+}
+
+/** An average star rating to one decimal — "4.5 ★", or "—". */
+export function formatRating(average: number | null): string {
+  return average === null ? NO_VALUE : `${average.toFixed(1)} ★`;
+}
+
+/** "1 rating", "3 ratings". */
+export function plural(count: number, word: string): string {
+  return `${count} ${word}${count === 1 ? "" : "s"}`;
+}
