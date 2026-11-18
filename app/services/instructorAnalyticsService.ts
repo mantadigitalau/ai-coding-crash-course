@@ -10,7 +10,10 @@ import {
   LessonProgressStatus,
   modules,
   purchases,
+  quizAnswers,
   quizAttempts,
+  quizOptions,
+  quizQuestions,
   quizzes,
   users,
   videoWatchEvents,
@@ -303,6 +306,7 @@ export type CourseAnalytics = {
   headline: CourseMetrics;
   revenue: RevenueBreakdown;
   seats: TeamSeats;
+  quizInsights: QuizInsights;
   dropOffLessons: DropOffLesson[];
 };
 
@@ -372,6 +376,7 @@ export function getCourseAnalytics(
     headline: toMetrics(sums),
     revenue: getRevenueBreakdown(courseId, course?.pppEnabled ?? false),
     seats: getTeamSeats(courseId),
+    quizInsights: getQuizInsights(courseId),
     dropOffLessons: getDropOffLessons(courseId, now),
   };
 }
@@ -392,6 +397,187 @@ function getTeamSeats(courseId: number): TeamSeats {
     .where(eq(coupons.courseId, courseId))
     .get();
   return { sold: row?.sold ?? 0, redeemed: row?.redeemed ?? 0 };
+}
+
+/** A share of students with the counts behind it; `rate` is null when `attempted` is 0. */
+export type PassRate = {
+  rate: number | null;
+  passed: number;
+  attempted: number;
+};
+
+export type QuizStats = {
+  quizId: number;
+  title: string;
+  /** Average of each student's first-attempt score (0..1). */
+  firstAttemptScore: QuizScoreAverage;
+  /** Students whose first attempt passed, out of students who attempted. */
+  firstAttemptPass: PassRate;
+  /** Students with any passing attempt, out of students who attempted. */
+  eventualPass: PassRate;
+};
+
+export type HardQuestion = {
+  questionId: number;
+  quizTitle: string;
+  questionText: string;
+  /** correct ÷ answers, 0..1. */
+  correctRate: number;
+  correct: number;
+  answers: number;
+  /** Text of the wrong option chosen most often; null when nobody chose a wrong one. */
+  mostCommonWrongOption: string | null;
+};
+
+export type QuizInsights = {
+  /** Every quiz in the course, in course order, including unattempted ones. */
+  quizzes: QuizStats[];
+  /** Up to 3 questions with the lowest % correct over all recorded answers. */
+  hardestQuestions: HardQuestion[];
+};
+
+const HARDEST_QUESTION_LIMIT = 3;
+const HARDEST_QUESTION_MIN_ANSWERS = 5;
+
+function passRate(passed: number, attempted: number): PassRate {
+  return {
+    rate: attempted === 0 ? null : passed / attempted,
+    passed,
+    attempted,
+  };
+}
+
+function getQuizInsights(courseId: number): QuizInsights {
+  const courseQuizzes = db
+    .select({ id: quizzes.id, title: quizzes.title })
+    .from(quizzes)
+    .innerJoin(lessons, eq(lessons.id, quizzes.lessonId))
+    .innerJoin(modules, eq(modules.id, lessons.moduleId))
+    .where(eq(modules.courseId, courseId))
+    .orderBy(asc(modules.position), asc(lessons.position), asc(quizzes.id))
+    .all();
+
+  const firstAttempts = firstQuizAttempts([courseId]);
+  const firstRows = db
+    .select({
+      quizId: firstAttempts.quizId,
+      scoreSum: sql<number>`coalesce(sum(${firstAttempts.score}), 0)`,
+      passed: sql<number>`coalesce(sum(case when ${firstAttempts.passed} then 1 else 0 end), 0)`,
+      attempted: sql<number>`count(*)`,
+    })
+    .from(firstAttempts)
+    .groupBy(firstAttempts.quizId)
+    .all();
+  const firstByQuiz = new Map(firstRows.map((r) => [r.quizId, r]));
+
+  const quizIds = courseQuizzes.map((q) => q.id);
+  const eventualRows =
+    quizIds.length === 0
+      ? []
+      : db
+          .select({
+            quizId: quizAttempts.quizId,
+            passed: sql<number>`count(distinct case when ${quizAttempts.passed} then ${quizAttempts.userId} end)`,
+            attempted: sql<number>`count(distinct ${quizAttempts.userId})`,
+          })
+          .from(quizAttempts)
+          .where(inArray(quizAttempts.quizId, quizIds))
+          .groupBy(quizAttempts.quizId)
+          .all();
+  const eventualByQuiz = new Map(eventualRows.map((r) => [r.quizId, r]));
+
+  return {
+    quizzes: courseQuizzes.map((quiz) => {
+      const first = firstByQuiz.get(quiz.id);
+      const eventual = eventualByQuiz.get(quiz.id);
+      const attempted = first?.attempted ?? 0;
+      return {
+        quizId: quiz.id,
+        title: quiz.title,
+        firstAttemptScore: {
+          average: attempted === 0 ? null : first!.scoreSum / attempted,
+          count: attempted,
+        },
+        firstAttemptPass: passRate(first?.passed ?? 0, attempted),
+        eventualPass: passRate(eventual?.passed ?? 0, eventual?.attempted ?? 0),
+      };
+    }),
+    hardestQuestions: getHardestQuestions(quizIds),
+  };
+}
+
+/**
+ * The questions in `quizIds` with the lowest share of correct answers, across
+ * every recorded answer (all attempts). Questions with fewer than 5 answers
+ * are left out. Ties go to the question with more answers, then lower id.
+ */
+function getHardestQuestions(quizIds: number[]): HardQuestion[] {
+  if (quizIds.length === 0) return [];
+
+  const correct = sql<number>`coalesce(sum(case when ${quizOptions.isCorrect} then 1 else 0 end), 0)`;
+  const answers = sql<number>`count(*)`;
+  const hardest = db
+    .select({
+      questionId: quizQuestions.id,
+      quizTitle: quizzes.title,
+      questionText: quizQuestions.questionText,
+      correct,
+      answers,
+    })
+    .from(quizAnswers)
+    .innerJoin(quizQuestions, eq(quizQuestions.id, quizAnswers.questionId))
+    .innerJoin(quizzes, eq(quizzes.id, quizQuestions.quizId))
+    .innerJoin(quizOptions, eq(quizOptions.id, quizAnswers.selectedOptionId))
+    .where(inArray(quizQuestions.quizId, quizIds))
+    .groupBy(quizQuestions.id)
+    .having(sql`${answers} >= ${HARDEST_QUESTION_MIN_ANSWERS}`)
+    .orderBy(
+      sql`cast(${correct} as real) / ${answers}`,
+      sql`${answers} desc`,
+      asc(quizQuestions.id)
+    )
+    .limit(HARDEST_QUESTION_LIMIT)
+    .all();
+
+  // Wrong-option counts for just those questions, most chosen first (ties:
+  // the option listed first), so the first row per question is the answer.
+  const wrongRows =
+    hardest.length === 0
+      ? []
+      : db
+          .select({
+            questionId: quizAnswers.questionId,
+            optionText: quizOptions.optionText,
+          })
+          .from(quizAnswers)
+          .innerJoin(
+            quizOptions,
+            eq(quizOptions.id, quizAnswers.selectedOptionId)
+          )
+          .where(
+            and(
+              inArray(
+                quizAnswers.questionId,
+                hardest.map((q) => q.questionId)
+              ),
+              eq(quizOptions.isCorrect, false)
+            )
+          )
+          .groupBy(quizAnswers.questionId, quizOptions.id)
+          .orderBy(sql`count(*) desc`, asc(quizOptions.id))
+          .all();
+  const wrongByQuestion = new Map<number, string>();
+  for (const row of wrongRows) {
+    if (!wrongByQuestion.has(row.questionId)) {
+      wrongByQuestion.set(row.questionId, row.optionText);
+    }
+  }
+
+  return hardest.map((q) => ({
+    ...q,
+    correctRate: q.correct / q.answers,
+    mostCommonWrongOption: wrongByQuestion.get(q.questionId) ?? null,
+  }));
 }
 
 // ─── Student activity ───

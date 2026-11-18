@@ -132,10 +132,10 @@ function teamPurchase(
   return row;
 }
 
-function createQuiz(courseId: number) {
+function createQuiz(courseId: number, title = "Quiz", position = 1) {
   const mod = testDb
     .insert(schema.modules)
-    .values({ courseId, title: "Module", position: 1 })
+    .values({ courseId, title: "Module", position })
     .returning()
     .get();
   const lesson = testDb
@@ -145,7 +145,7 @@ function createQuiz(courseId: number) {
     .get();
   return testDb
     .insert(schema.quizzes)
-    .values({ lessonId: lesson.id, title: "Quiz", passingScore: 0.7 })
+    .values({ lessonId: lesson.id, title, passingScore: 0.7 })
     .returning()
     .get();
 }
@@ -161,6 +161,50 @@ function attempt(
     .values({ userId, quizId, score, passed: score > 0.7, attemptedAt })
     .returning()
     .get();
+}
+
+/** A single-choice question; returns the question and its options in order. */
+function createQuestion(quizId: number, text: string, optionTexts: string[], correctIndex = 0) {
+  const question = testDb
+    .insert(schema.quizQuestions)
+    .values({
+      quizId,
+      questionText: text,
+      questionType: schema.QuestionType.MultipleChoice,
+      position: 1,
+    })
+    .returning()
+    .get();
+  const options = optionTexts.map((optionText, i) =>
+    testDb
+      .insert(schema.quizOptions)
+      .values({ questionId: question.id, optionText, isCorrect: i === correctIndex })
+      .returning()
+      .get()
+  );
+  return { question, options };
+}
+
+/**
+ * Records one answer per selected option, each in its own attempt by a new
+ * student. `selections` lists option indexes.
+ */
+function answerMany(
+  quizId: number,
+  q: ReturnType<typeof createQuestion>,
+  selections: number[]
+) {
+  for (const index of selections) {
+    const a = attempt(createStudent().id, quizId, 0.5, daysBefore(3));
+    testDb
+      .insert(schema.quizAnswers)
+      .values({
+        attemptId: a.id,
+        questionId: q.question.id,
+        selectedOptionId: q.options[index].id,
+      })
+      .run();
+  }
 }
 
 function rate(userId: number, courseId: number, rating: number) {
@@ -498,6 +542,116 @@ describe("instructorAnalyticsService", () => {
         sold: 0,
         redeemed: 0,
       });
+    });
+  });
+  describe("getCourseAnalytics quiz insights", () => {
+    it("reports first-attempt average and pass rate, and eventual pass rate, per quiz", () => {
+      const quiz = createQuiz(base.course.id, "Basics Quiz");
+      const alice = createStudent();
+      const bob = createStudent();
+      const carol = createStudent();
+
+      // Alice fails, then passes on a retake (retake inserted first).
+      attempt(alice.id, quiz.id, 0.9, daysBefore(5));
+      attempt(alice.id, quiz.id, 0.5, daysBefore(10));
+      // Bob passes first time.
+      attempt(bob.id, quiz.id, 0.8, daysBefore(8));
+      // Carol fails twice.
+      attempt(carol.id, quiz.id, 0.2, daysBefore(9));
+      attempt(carol.id, quiz.id, 0.6, daysBefore(7));
+
+      const [stats] = getCourseAnalytics(base.course.id, NOW).quizInsights.quizzes;
+
+      expect(stats.title).toBe("Basics Quiz");
+      expect(stats.firstAttemptScore.count).toBe(3);
+      expect(stats.firstAttemptScore.average).toBeCloseTo(0.5);
+      expect(stats.firstAttemptPass).toEqual({ rate: 1 / 3, passed: 1, attempted: 3 });
+      expect(stats.eventualPass).toEqual({ rate: 2 / 3, passed: 2, attempted: 3 });
+    });
+
+    it("lists quizzes with no attempts with null rates, in course order", () => {
+      const later = createQuiz(base.course.id, "Later Quiz", 2);
+      const earlier = createQuiz(base.course.id, "Earlier Quiz", 1);
+      attempt(createStudent().id, earlier.id, 0.8, daysBefore(3));
+      createQuiz(createCourse("Other Course").id, "Other Quiz");
+
+      const { quizzes } = getCourseAnalytics(base.course.id, NOW).quizInsights;
+
+      expect(quizzes.map((q) => q.quizId)).toEqual([earlier.id, later.id]);
+      expect(quizzes[1]).toMatchObject({
+        firstAttemptScore: { average: null, count: 0 },
+        firstAttemptPass: { rate: null, passed: 0, attempted: 0 },
+        eventualPass: { rate: null, passed: 0, attempted: 0 },
+      });
+    });
+    it("leaves out questions with fewer than 5 answers", () => {
+      const quiz = createQuiz(base.course.id, "Basics Quiz");
+      const sparse = createQuestion(quiz.id, "Sparse?", ["Right", "Wrong"]);
+      const enough = createQuestion(quiz.id, "Enough?", ["Right", "Wrong"]);
+      answerMany(quiz.id, sparse, [1, 1, 1, 1]);
+      answerMany(quiz.id, enough, [0, 0, 0, 1, 1]);
+
+      const { hardestQuestions } = getCourseAnalytics(base.course.id, NOW).quizInsights;
+
+      expect(hardestQuestions).toEqual([
+        {
+          questionId: enough.question.id,
+          quizTitle: "Basics Quiz",
+          questionText: "Enough?",
+          correctRate: 0.6,
+          correct: 3,
+          answers: 5,
+          mostCommonWrongOption: "Wrong",
+        },
+      ]);
+    });
+    it("ranks the 3 questions with the lowest % correct across the course's quizzes", () => {
+      const quizA = createQuiz(base.course.id, "Quiz A", 1);
+      const quizB = createQuiz(base.course.id, "Quiz B", 2);
+      const easy = createQuestion(quizA.id, "Easy", ["R", "W"]);
+      const hardest = createQuestion(quizB.id, "Hardest", ["R", "W"]);
+      const hard = createQuestion(quizA.id, "Hard", ["R", "W"]);
+      const middling = createQuestion(quizB.id, "Middling", ["R", "W"]);
+      answerMany(quizA.id, easy, [0, 0, 0, 0, 0]); // 100%
+      answerMany(quizB.id, hardest, [1, 1, 1, 1, 0]); // 20%
+      answerMany(quizA.id, hard, [0, 1, 1, 1, 0, 1]); // 33%
+      answerMany(quizB.id, middling, [0, 0, 0, 1, 1]); // 60%
+
+      // A harder question in another course never appears.
+      const otherQuiz = createQuiz(createCourse("Other Course").id);
+      answerMany(otherQuiz.id, createQuestion(otherQuiz.id, "Other", ["R", "W"]), [1, 1, 1, 1, 1]);
+
+      const { hardestQuestions } = getCourseAnalytics(base.course.id, NOW).quizInsights;
+
+      expect(
+        hardestQuestions.map((q) => [q.questionText, q.quizTitle, q.correct, q.answers])
+      ).toEqual([
+        ["Hardest", "Quiz B", 1, 5],
+        ["Hard", "Quiz A", 2, 6],
+        ["Middling", "Quiz B", 3, 5],
+      ]);
+    });
+
+    it("names the wrong option chosen most often, and null when every answer was right", () => {
+      const quiz = createQuiz(base.course.id);
+      const split = createQuestion(quiz.id, "Split", ["Right", "Wrong A", "Wrong B", "Wrong C"]);
+      const tied = createQuestion(quiz.id, "Tied", ["Right", "Wrong A", "Wrong B"]);
+      const allRight = createQuestion(quiz.id, "All right", ["Right", "Wrong"]);
+      // Correct is the most-chosen option overall, but only wrong ones count.
+      answerMany(quiz.id, split, [0, 0, 0, 0, 1, 2, 2, 3]);
+      // Equal counts: the option listed first wins.
+      answerMany(quiz.id, tied, [0, 2, 1, 2, 1]);
+      answerMany(quiz.id, allRight, [0, 0, 0, 0, 0]);
+
+      const byText = new Map(
+        getCourseAnalytics(base.course.id, NOW).quizInsights.hardestQuestions.map(
+          (q) => [q.questionText, q.mostCommonWrongOption]
+        )
+      );
+
+      expect(byText.get("Split")).toBe("Wrong B");
+      expect(byText.get("Tied")).toBe("Wrong A");
+      expect(byText.get("All right")).toBeNull();
     });
   });
 
