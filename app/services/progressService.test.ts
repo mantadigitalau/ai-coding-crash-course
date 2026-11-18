@@ -23,6 +23,7 @@ import {
   getTotalLessonCount,
   isLessonCompleted,
   getNextIncompleteLesson,
+  progressPercent,
 } from "./progressService";
 import { enrollUser, findEnrollment } from "./enrollmentService";
 import { createLesson } from "./lessonService";
@@ -232,6 +233,18 @@ describe("progressService", () => {
       const { lessons } = createModuleWithLessons(base.course.id, "Module 1", 1, 1);
 
       expect(isLessonCompleted(base.user.id, lessons[0].id)).toBe(false);
+    });
+  });
+
+  describe("progressPercent", () => {
+    it("is the completed share as a whole percent", () => {
+      expect(progressPercent(1, 3)).toBe(33);
+      expect(progressPercent(2, 3)).toBe(67);
+      expect(progressPercent(4, 4)).toBe(100);
+    });
+
+    it("is 0 when there is nothing to complete", () => {
+      expect(progressPercent(0, 0)).toBe(0);
     });
   });
 

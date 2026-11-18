@@ -166,6 +166,15 @@ function getCourseLessonIds(courseId: number): number[] {
   return courseLessons.map((l) => l.id);
 }
 
+/**
+ * Course progress as a whole percent: the completed share of `total`, rounded.
+ * The one definition of the percentage — 0 when there is nothing to complete.
+ */
+export function progressPercent(completed: number, total: number): number {
+  if (total === 0) return 0;
+  return Math.round((completed / total) * 100);
+}
+
 export function calculateProgress(
   userId: number,
   courseId: number,
@@ -191,8 +200,6 @@ export function calculateProgress(
       0
     );
 
-    if (totalDuration === 0) return 0;
-
     const completed = db
       .select()
       .from(lessonProgress)
@@ -211,7 +218,7 @@ export function calculateProgress(
       .filter((l) => completedIds.has(l.id))
       .reduce((sum, l) => sum + (l.durationMinutes ?? 1), 0);
 
-    return Math.round((completedDuration / totalDuration) * 100);
+    return progressPercent(completedDuration, totalDuration);
   }
 
   const completedCount = db
@@ -226,7 +233,7 @@ export function calculateProgress(
     )
     .get();
 
-  return Math.round(((completedCount?.count ?? 0) / lessonIds.length) * 100);
+  return progressPercent(completedCount?.count ?? 0, lessonIds.length);
 }
 
 export function getCompletedLessonCount(userId: number, courseId: number) {

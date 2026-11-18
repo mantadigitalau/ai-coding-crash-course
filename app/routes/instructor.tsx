@@ -4,19 +4,19 @@ import { getInstructorDashboard } from "~/services/instructorAnalyticsService";
 import { getCurrentUserId } from "~/lib/session";
 import { getUserById } from "~/services/userService";
 import { Card, CardContent } from "~/components/ui/card";
-import { StatCard, StatCardSkeleton } from "~/components/stat-card";
+import {
+  CourseMetricsStats,
+  CourseMetricsStatsSkeleton,
+} from "~/components/course-metrics-stats";
+import { TableHeaderCell } from "~/components/table-header-cell";
 import { Button } from "~/components/ui/button";
 import { Skeleton } from "~/components/ui/skeleton";
 import {
   AlertTriangle,
   BarChart3,
-  CheckCircle2,
-  DollarSign,
   GraduationCap,
   Pencil,
   Plus,
-  Star,
-  Users,
 } from "lucide-react";
 import { data, isRouteErrorResponse } from "react-router";
 import { CourseStatus, UserRole } from "~/db/schema";
@@ -25,7 +25,7 @@ import {
   formatRating,
   formatShare,
   formatUsd,
-  plural,
+  formatCount,
 } from "~/lib/utils";
 
 export function meta() {
@@ -80,10 +80,7 @@ function statusBadge(status: string) {
   }
 }
 
-const TH_CLASS =
-  "px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground";
-
-const COLUMNS = [
+const COURSE_TABLE_COLUMNS = [
   "Course",
   "Students",
   "Revenue",
@@ -111,10 +108,8 @@ function CourseTableHead() {
   return (
     <thead>
       <tr className="border-b border-border bg-muted/50">
-        {COLUMNS.map((column) => (
-          <th key={column} className={TH_CLASS}>
-            {column}
-          </th>
+        {COURSE_TABLE_COLUMNS.map((column) => (
+          <TableHeaderCell key={column}>{column}</TableHeaderCell>
         ))}
       </tr>
     </thead>
@@ -131,10 +126,8 @@ export function HydrateFallback() {
         </div>
         <Skeleton className="h-10 w-32" />
       </div>
-      <div className="mb-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-        {Array.from({ length: 5 }).map((_, i) => (
-          <StatCardSkeleton key={i} />
-        ))}
+      <div className="mb-8">
+        <CourseMetricsStatsSkeleton />
       </div>
       <Card className="py-0">
         <CardContent className="p-0">
@@ -201,41 +194,8 @@ export default function InstructorDashboard({
         </div>
       ) : (
         <>
-          <div className="mb-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-            <StatCard
-              label="Students"
-              icon={Users}
-              value={String(totals.students)}
-              detail={`+${totals.studentsLast30Days} in last 30 days`}
-            />
-            <StatCard
-              label="Gross revenue (USD)"
-              icon={DollarSign}
-              value={formatUsd(totals.revenueCents)}
-              detail={`+${formatUsd(totals.revenueLast30DaysCents)} in last 30 days`}
-            />
-            <StatCard
-              label="Completion rate"
-              icon={CheckCircle2}
-              value={formatShare(
-                totals.completion.rate,
-                totals.completion.completed,
-                totals.completion.enrolled
-              )}
-              detail="Completed ÷ enrolled"
-            />
-            <StatCard
-              label="Avg quiz score"
-              icon={GraduationCap}
-              value={formatQuizScore(totals.avgQuizScore.average)}
-              detail={`First attempts · ${plural(totals.avgQuizScore.count, "attempt")}`}
-            />
-            <StatCard
-              label="Avg rating"
-              icon={Star}
-              value={formatRating(totals.rating.average)}
-              detail={plural(totals.rating.count, "rating")}
-            />
+          <div className="mb-8">
+            <CourseMetricsStats metrics={totals} />
           </div>
 
           <Card className="py-0">
@@ -251,12 +211,9 @@ export default function InstructorDashboard({
                       >
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-2">
-                            <Link
-                              to={`/courses/${course.slug}`}
-                              className="font-medium hover:text-primary"
-                            >
+                            <span className="font-medium">
                               {course.title}
-                            </Link>
+                            </span>
                             {statusBadge(course.status)}
                           </div>
                         </td>
@@ -278,7 +235,7 @@ export default function InstructorDashboard({
                           {course.avgQuizScore.average !== null && (
                             <span className="text-muted-foreground">
                               {" "}
-                              · {plural(course.avgQuizScore.count, "attempt")}
+                              · {formatCount(course.avgQuizScore.count, "attempt")}
                             </span>
                           )}
                         </td>
@@ -287,7 +244,7 @@ export default function InstructorDashboard({
                           {course.rating.average !== null && (
                             <span className="text-muted-foreground">
                               {" "}
-                              · {plural(course.rating.count, "rating")}
+                              · {formatCount(course.rating.count, "rating")}
                             </span>
                           )}
                         </td>

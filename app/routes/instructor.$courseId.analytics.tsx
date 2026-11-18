@@ -3,37 +3,29 @@ import type { Route } from "./+types/instructor.$courseId.analytics";
 import { getCourseById } from "~/services/courseService";
 import {
   getCourseAnalytics,
-  type CourseMetrics,
   type QuizInsights,
   type RevenueBreakdown,
   type TeamSeats,
   DROP_OFF_INACTIVE_DAYS,
   type DropOffLesson,
 } from "~/services/instructorAnalyticsService";
-import { getUserById } from "~/services/userService";
-import { getCurrentUserId } from "~/lib/session";
-import { UserRole } from "~/db/schema";
+import { requireStaff, requireUserId } from "~/lib/access.server";
 import { Card, CardContent, CardHeader, CardTitle } from "~/components/ui/card";
 import { Button } from "~/components/ui/button";
 import { Skeleton } from "~/components/ui/skeleton";
-import { StatCard, StatCardSkeleton } from "~/components/stat-card";
 import {
-  AlertTriangle,
-  ArrowLeft,
-  CheckCircle2,
-  DollarSign,
-  GraduationCap,
-  Star,
-  Ticket,
-  Users,
-} from "lucide-react";
+  CourseMetricsStats,
+  CourseMetricsStatsSkeleton,
+} from "~/components/course-metrics-stats";
+import { TableHeaderCell } from "~/components/table-header-cell";
+import { AlertTriangle, ArrowLeft, Ticket, Users } from "lucide-react";
 import { data, isRouteErrorResponse } from "react-router";
 import {
+  formatCount,
   formatQuizScore,
-  formatRating,
   formatShare,
   formatUsd,
-  plural,
+  NO_VALUE,
 } from "~/lib/utils";
 
 export function meta({ loaderData }: Route.MetaArgs) {
@@ -45,21 +37,7 @@ export function meta({ loaderData }: Route.MetaArgs) {
 }
 
 export async function loader({ params, request }: Route.LoaderArgs) {
-  const currentUserId = await getCurrentUserId(request);
-
-  if (!currentUserId) {
-    throw data("Select a user from the DevUI panel to view course analytics.", {
-      status: 401,
-    });
-  }
-
-  const user = getUserById(currentUserId);
-
-  if (!user || (user.role !== UserRole.Instructor && user.role !== UserRole.Admin)) {
-    throw data("Only instructors and admins can access this page.", {
-      status: 403,
-    });
-  }
+  await requireUserId(request);
 
   const courseId = parseInt(params.courseId, 10);
   if (isNaN(courseId)) {
@@ -72,11 +50,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     throw data("Course not found.", { status: 404 });
   }
 
-  if (course.instructorId !== currentUserId && user.role !== UserRole.Admin) {
-    throw data("You can only view analytics for your own courses.", {
-      status: 403,
-    });
-  }
+  await requireStaff(request, courseId);
 
   return {
     course: { id: course.id, title: course.title },
@@ -106,47 +80,6 @@ function SectionCard({
       </CardHeader>
       <CardContent>{children}</CardContent>
     </Card>
-  );
-}
-
-function HeadlineStats({ headline }: { headline: CourseMetrics }) {
-  return (
-    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-      <StatCard
-        label="Students"
-        icon={Users}
-        value={String(headline.students)}
-        detail={`+${headline.studentsLast30Days} in last 30 days`}
-      />
-      <StatCard
-        label="Gross revenue (USD)"
-        icon={DollarSign}
-        value={formatUsd(headline.revenueCents)}
-        detail={`+${formatUsd(headline.revenueLast30DaysCents)} in last 30 days`}
-      />
-      <StatCard
-        label="Completion rate"
-        icon={CheckCircle2}
-        value={formatShare(
-          headline.completion.rate,
-          headline.completion.completed,
-          headline.completion.enrolled
-        )}
-        detail="Completed ÷ enrolled"
-      />
-      <StatCard
-        label="Avg quiz score"
-        icon={GraduationCap}
-        value={formatQuizScore(headline.avgQuizScore.average)}
-        detail={`First attempts · ${plural(headline.avgQuizScore.count, "attempt")}`}
-      />
-      <StatCard
-        label="Rating"
-        icon={Star}
-        value={formatRating(headline.rating.average)}
-        detail={plural(headline.rating.count, "rating")}
-      />
-    </div>
   );
 }
 
@@ -231,7 +164,7 @@ function TeamSeatsSection({ seats }: { seats: TeamSeats }) {
           ) : (
             <>
               <span className="font-medium tabular-nums">
-                {plural(seats.sold, "seat")}
+                {formatCount(seats.sold, "seat")}
               </span>{" "}
               sold,{" "}
               <span className="font-medium tabular-nums">{seats.redeemed}</span>{" "}
@@ -245,8 +178,6 @@ function TeamSeatsSection({ seats }: { seats: TeamSeats }) {
 }
 
 function QuizInsightsSection({ insights }: { insights: QuizInsights }) {
-  const th =
-    "px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground";
   return (
     <SectionCard
       title="Quiz insights"
@@ -260,10 +191,10 @@ function QuizInsightsSection({ insights }: { insights: QuizInsights }) {
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-border bg-muted/50">
-                  <th className={th}>Quiz</th>
-                  <th className={th}>First-attempt avg</th>
-                  <th className={th}>First-attempt pass</th>
-                  <th className={th}>Eventual pass</th>
+                  <TableHeaderCell>Quiz</TableHeaderCell>
+                  <TableHeaderCell>First-attempt avg</TableHeaderCell>
+                  <TableHeaderCell>First-attempt pass</TableHeaderCell>
+                  <TableHeaderCell>Eventual pass</TableHeaderCell>
                 </tr>
               </thead>
               <tbody>
@@ -277,7 +208,7 @@ function QuizInsightsSection({ insights }: { insights: QuizInsights }) {
                       {formatQuizScore(quiz.firstAttemptScore.average)}
                       {quiz.firstAttemptScore.count > 0 && (
                         <span className="ml-2 text-muted-foreground">
-                          {plural(quiz.firstAttemptScore.count, "student")}
+                          {formatCount(quiz.firstAttemptScore.count, "student")}
                         </span>
                       )}
                     </td>
@@ -324,9 +255,9 @@ function QuizInsightsSection({ insights }: { insights: QuizInsights }) {
                       </span>
                     </div>
                     <p className="mt-1 text-muted-foreground">
-                      {plural(q.answers, "answer")} · most common wrong answer:{" "}
+                      {formatCount(q.answers, "answer")} · most common wrong answer:{" "}
                       <span className="text-foreground">
-                        {q.mostCommonWrongOption ?? "—"}
+                        {q.mostCommonWrongOption ?? NO_VALUE}
                       </span>
                     </p>
                   </li>
@@ -370,7 +301,7 @@ function DropOffSection({
                 {lesson.lessonTitle}
               </span>
               <span className="font-medium tabular-nums">
-                {plural(lesson.students, "student")}
+                {formatCount(lesson.students, "student")}
               </span>
             </li>
           ))}
@@ -406,10 +337,8 @@ export function HydrateFallback() {
         </div>
         <Skeleton className="h-10 w-36" />
       </div>
-      <div className="mb-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-        {Array.from({ length: 5 }).map((_, i) => (
-          <StatCardSkeleton key={i} />
-        ))}
+      <div className="mb-6">
+        <CourseMetricsStatsSkeleton />
       </div>
       <div className="space-y-6">
         <SectionSkeleton />
@@ -452,7 +381,7 @@ export default function CourseAnalytics({ loaderData }: Route.ComponentProps) {
       </div>
 
       <div className="space-y-6">
-        <HeadlineStats headline={headline} />
+        <CourseMetricsStats metrics={headline} />
         <RevenueSection revenue={revenue} totalCents={headline.revenueCents} />
         <TeamSeatsSection seats={seats} />
         <QuizInsightsSection insights={loaderData.quizInsights} />
