@@ -12,6 +12,7 @@ import {
   QuestionType,
   TeamMemberRole,
 } from "../app/db/schema";
+import { calculatePppPrice } from "../app/lib/ppp";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -29,6 +30,17 @@ function daysAgo(n: number): string {
   const d = new Date();
   d.setDate(d.getDate() - n);
   return d.toISOString();
+}
+
+// Seeded PRNG so the generated cohort is the same on every run.
+function mulberry32(seed: number): () => number {
+  let a = seed;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
 function slugify(title: string): string {
@@ -1913,18 +1925,446 @@ You've completed the Building REST APIs course. You now have the skills to build
     `Created 1 team with Bossy McBossface as admin, 1 team purchase, and ${seededCoupons.length} coupons (2 redeemed, 3 available).`
   );
 
-  console.log("\n✓ Seed complete!");
-  console.log("  Users: 9 (1 admin, 2 instructors, 6 students)");
-  console.log("  Categories: 5");
-  console.log(
-    `  Courses: 2 (${course1LessonIds.length} + ${course2LessonIds.length} lessons)`
+  // ─── Analytics Cohort ───
+  // A larger, deterministic cohort so the instructor analytics have realistic
+  // numbers to check by eye: ~40 students, ~60 purchases over ~90 days across
+  // every PPP tier, team seats partly redeemed, and a mix of completed, active
+  // and inactive (14+ days) students. Wrong quiz answers concentrate on one
+  // question per quiz, mostly on one specific wrong option.
+
+  const random = mulberry32(20261118);
+  const pick = <T>(items: readonly T[]): T =>
+    items[Math.floor(random() * items.length)];
+
+  const firstNames = [
+    "Noah", "Ava", "Mateo", "Isla", "Arjun", "Chloe", "Kenji", "Zara",
+    "Lucas", "Amara", "Diego", "Freya", "Ravi", "Leah", "Tomasz", "Nia",
+    "Hugo", "Priya", "Felix", "Yuki", "Omar", "Elena", "Kofi", "Ingrid",
+    "Rafael", "Mei", "Sven", "Aisha", "Pablo", "Hana", "Ethan", "Lina",
+    "Dmitri", "Grace",
+  ];
+  const lastNames = [
+    "Okafor", "Silva", "Novak", "Patel", "Kowalski", "Nguyen", "Tanaka",
+    "Haddad", "Larsen", "Mensah", "Rossi", "Fischer", "Ahmed", "Reyes",
+    "Dubois", "Sato", "Mwangi", "Berg", "Costa", "Khan",
+  ];
+
+  const cohort = db
+    .insert(schema.users)
+    .values(
+      firstNames.map((first, i) => {
+        const last = lastNames[i % lastNames.length];
+        return {
+          name: `${first} ${last}`,
+          email: `${first}.${last}@student.dev`.toLowerCase(),
+          role: UserRole.Student,
+          avatarUrl: `https://api.dicebear.com/9.x/avataaars/svg?seed=${first.toLowerCase()}`,
+          createdAt: daysAgo(95),
+        };
+      })
+    )
+    .returning()
+    .all();
+
+  // Countries cycle through every PPP tier, with some purchases carrying no
+  // country at all (counted as full price).
+  const purchaseCountries: (string | null)[] = [
+    "US", "IN", "GB", "BR", null, "DE", "NG", "PL", "AU", "PH",
+    "CA", "MX", "EG", null, "FR", "ZA", "JP", "TR", "KE", "NL",
+  ];
+
+  type CohortEnrollment = {
+    userId: number;
+    courseId: number;
+    lessonIds: number[];
+    enrolledDaysAgo: number;
+  };
+  const cohortEnrollments: CohortEnrollment[] = [];
+  let cohortPurchaseCount = 0;
+
+  function enroll(
+    userId: number,
+    courseId: number,
+    lessonIds: number[],
+    enrolledDaysAgo: number
+  ) {
+    db.insert(schema.enrollments)
+      .values({ userId, courseId, enrolledAt: daysAgo(enrolledDaysAgo) })
+      .run();
+    cohortEnrollments.push({ userId, courseId, lessonIds, enrolledDaysAgo });
+  }
+
+  function buyIndividually(
+    userId: number,
+    course: { id: number; price: number },
+    lessonIds: number[],
+    boughtDaysAgo: number,
+    country: string | null
+  ) {
+    db.insert(schema.purchases)
+      .values({
+        userId,
+        courseId: course.id,
+        amountPaid: calculatePppPrice(course.price, country),
+        country,
+        createdAt: daysAgo(boughtDaysAgo),
+      })
+      .run();
+    cohortPurchaseCount++;
+    enroll(userId, course.id, lessonIds, boughtDaysAgo);
+  }
+
+  // Course 1 (90 days old) individual buyers: cohort 0–24 and 29–31.
+  const course1Buyers = [...cohort.slice(0, 25), ...cohort.slice(29, 32)];
+  course1Buyers.forEach((student, i) => {
+    buyIndividually(
+      student.id,
+      course1,
+      course1LessonIds,
+      88 - Math.round((i * 86) / course1Buyers.length),
+      purchaseCountries[i % purchaseCountries.length]
+    );
+  });
+
+  // Course 2 (75 days old) individual buyers: cohort 10–31.
+  const course2Buyers = cohort.slice(10, 32);
+  course2Buyers.forEach((student, i) => {
+    buyIndividually(
+      student.id,
+      course2,
+      course2LessonIds,
+      73 - Math.round((i * 71) / course2Buyers.length),
+      purchaseCountries[(i + 7) % purchaseCountries.length]
+    );
+  });
+
+  function buyTeamSeats(
+    buyerId: number,
+    course: { id: number; price: number },
+    seats: number,
+    boughtDaysAgo: number,
+    country: string | null,
+    codePrefix: string
+  ) {
+    const [team] = db
+      .insert(schema.teams)
+      .values({ createdAt: daysAgo(boughtDaysAgo) })
+      .returning()
+      .all();
+    db.insert(schema.teamMembers)
+      .values({
+        teamId: team.id,
+        userId: buyerId,
+        role: TeamMemberRole.Admin,
+        createdAt: daysAgo(boughtDaysAgo),
+      })
+      .run();
+    const [purchase] = db
+      .insert(schema.purchases)
+      .values({
+        userId: buyerId,
+        courseId: course.id,
+        amountPaid: calculatePppPrice(course.price, country) * seats,
+        country,
+        createdAt: daysAgo(boughtDaysAgo),
+      })
+      .returning()
+      .all();
+    cohortPurchaseCount++;
+    return db
+      .insert(schema.coupons)
+      .values(
+        Array.from({ length: seats }, (_, s) => ({
+          teamId: team.id,
+          courseId: course.id,
+          code: `${codePrefix}-${String(s + 1).padStart(2, "0")}`,
+          purchaseId: purchase.id,
+          createdAt: daysAgo(boughtDaysAgo),
+        }))
+      )
+      .returning()
+      .all();
+  }
+
+  function redeemSeat(
+    couponId: number,
+    userId: number,
+    courseId: number,
+    lessonIds: number[],
+    redeemedDaysAgo: number
+  ) {
+    db.update(schema.coupons)
+      .set({ redeemedByUserId: userId, redeemedAt: daysAgo(redeemedDaysAgo) })
+      .where(eq(schema.coupons.id, couponId))
+      .run();
+    enroll(userId, courseId, lessonIds, redeemedDaysAgo);
+  }
+
+  // Course 1 team: Dmitri (cohort 32) buys 6 seats, cohort 25–28 redeem 4.
+  const course1TeamCoupons = buyTeamSeats(
+    cohort[32].id,
+    course1,
+    6,
+    60,
+    "SG",
+    "TEAM-TS-ACME"
   );
-  console.log("  Quizzes: 3");
-  console.log("  Enrollments: 7");
-  console.log("  Course ratings: 6");
+  cohort.slice(25, 29).forEach((student, i) => {
+    redeemSeat(
+      course1TeamCoupons[i].id,
+      student.id,
+      course1.id,
+      course1LessonIds,
+      58 - i * 6
+    );
+  });
+
+  // Course 2 team: Dmitri buys 4 seats from Brazil, cohort 0–1 redeem 2.
+  const course2TeamCoupons = buyTeamSeats(
+    cohort[32].id,
+    course2,
+    4,
+    50,
+    "BR",
+    "TEAM-NODE-ACME"
+  );
+  cohort.slice(0, 2).forEach((student, i) => {
+    redeemSeat(
+      course2TeamCoupons[i].id,
+      student.id,
+      course2.id,
+      course2LessonIds,
+      48 - i * 10
+    );
+  });
+
+  // Grace (cohort 33) redeems a third seat on Bossy's team; 2 of 5 stay unused.
+  redeemSeat(seededCoupons[2].id, cohort[33].id, course2.id, course2LessonIds, 20);
+
+  // ─── Cohort progress, quizzes, video and ratings ───
+
+  const cohortQuizzes = [quiz1, quiz2, quiz3];
+  const quizzesByLesson = new Map(cohortQuizzes.map((q) => [q.lessonId, q]));
+
+  // The question (by position) in each quiz that most students get wrong, and
+  // the wrong option they usually pick.
+  const hardQuestions: Record<number, { position: number; trap: string }> = {
+    [quiz1.id]: { position: 3, trap: "package.json" },
+    [quiz2.id]: { position: 1, trap: "Better error messages" },
+    [quiz3.id]: { position: 3, trap: "200 OK" },
+  };
+
+  const questionsByQuiz = new Map(
+    cohortQuizzes.map((quiz) => [
+      quiz.id,
+      db
+        .select()
+        .from(schema.quizQuestions)
+        .where(eq(schema.quizQuestions.quizId, quiz.id))
+        .all()
+        .sort((a, b) => a.position - b.position)
+        .map((question) => ({
+          ...question,
+          options: db
+            .select()
+            .from(schema.quizOptions)
+            .where(eq(schema.quizOptions.questionId, question.id))
+            .all(),
+        })),
+    ])
+  );
+
+  function takeQuiz(
+    userId: number,
+    quiz: { id: number; passingScore: number },
+    attemptDaysAgo: number,
+    skill: number
+  ) {
+    const hard = hardQuestions[quiz.id];
+    const questions = questionsByQuiz.get(quiz.id)!;
+    const selections = questions.map((question) => {
+      const isHard = question.position === hard.position;
+      const chanceCorrect = isHard ? 0.3 + skill * 0.3 : 0.75 + skill * 0.2;
+      if (random() < chanceCorrect) {
+        return question.options.find((o) => o.isCorrect)!;
+      }
+      const wrong = question.options.filter((o) => !o.isCorrect);
+      const trap = wrong.find((o) => o.optionText === hard.trap);
+      if (isHard && trap && random() < 0.75) return trap;
+      return pick(wrong);
+    });
+    const score =
+      selections.filter((o) => o.isCorrect).length / questions.length;
+    const passed = score >= quiz.passingScore;
+    const [attempt] = db
+      .insert(schema.quizAttempts)
+      .values({
+        userId,
+        quizId: quiz.id,
+        score,
+        passed,
+        attemptedAt: daysAgo(attemptDaysAgo),
+      })
+      .returning()
+      .all();
+    db.insert(schema.quizAnswers)
+      .values(
+        selections.map((option) => ({
+          attemptId: attempt.id,
+          questionId: option.questionId,
+          selectedOptionId: option.id,
+        }))
+      )
+      .run();
+    return passed;
+  }
+
+  // Inactive students stop after this many completed lessons. Most get stuck
+  // right after a quiz lesson (lesson index 3, and 8 in course 1).
+  const dropOffStops = [3, 8, 3, 1, 3, 0, 8, 12, 3, 5];
+  let nextDropOff = 0;
+  const profileCycle = [
+    "completed",
+    "active",
+    "inactive",
+    "active",
+    "inactive",
+  ] as const;
+
+  cohortEnrollments.forEach((enrollment, i) => {
+    const { userId, courseId, lessonIds, enrolledDaysAgo } = enrollment;
+    // Recent enrollees are always active; finishers need time to finish.
+    let profile: (typeof profileCycle)[number] =
+      enrolledDaysAgo < 20 ? "active" : profileCycle[i % profileCycle.length];
+    if (profile === "completed" && enrolledDaysAgo < 25) profile = "active";
+
+    let completedCount: number;
+    let lastActiveDaysAgo: number;
+    if (profile === "completed") {
+      completedCount = lessonIds.length;
+      lastActiveDaysAgo =
+        1 + Math.floor(random() * Math.min(20, enrolledDaysAgo - 20));
+    } else if (profile === "active") {
+      completedCount = 1 + Math.floor(random() * (lessonIds.length - 2));
+      lastActiveDaysAgo = Math.floor(random() * Math.min(10, enrolledDaysAgo));
+    } else {
+      completedCount = dropOffStops[nextDropOff++ % dropOffStops.length];
+      lastActiveDaysAgo =
+        15 + Math.floor(random() * Math.min(40, enrolledDaysAgo - 16));
+    }
+
+    // Spread lesson completions evenly from enrollment to last activity.
+    const skill = random();
+    for (let l = 0; l < completedCount; l++) {
+      const day = Math.round(
+        enrolledDaysAgo -
+          ((enrolledDaysAgo - lastActiveDaysAgo) * (l + 1)) / completedCount
+      );
+      markComplete(userId, lessonIds[l], day);
+
+      const quiz = quizzesByLesson.get(lessonIds[l]);
+      if (quiz) {
+        const passed = takeQuiz(userId, quiz, day, skill);
+        // Most students who fail retake the quiz the same day.
+        if (!passed && random() < 0.7) {
+          takeQuiz(userId, quiz, day, Math.min(1, skill + 0.4));
+        }
+      }
+    }
+
+    if (completedCount > 0) {
+      const lastLesson = lessonIds[completedCount - 1];
+      addWatchEvent(userId, lastLesson, "play", 0, lastActiveDaysAgo);
+      addWatchEvent(userId, lastLesson, "ended", 420, lastActiveDaysAgo);
+    }
+    if (profile === "active") {
+      const nextLesson = lessonIds[completedCount];
+      markInProgress(userId, nextLesson);
+      addWatchEvent(userId, nextLesson, "play", 0, lastActiveDaysAgo);
+      addWatchEvent(userId, nextLesson, "pause", 95, lastActiveDaysAgo);
+    }
+
+    // Students further along are more likely to rate, and rate higher.
+    const progress = completedCount / lessonIds.length;
+    if (progress >= 0.25 && random() < 0.4 + progress * 0.5) {
+      const rating = Math.min(
+        5,
+        Math.max(2, Math.round(2.5 + progress * 2 + random()))
+      );
+      db.insert(schema.courseRatings)
+        .values({
+          userId,
+          courseId,
+          rating,
+          createdAt: daysAgo(lastActiveDaysAgo),
+          updatedAt: daysAgo(lastActiveDaysAgo),
+        })
+        .run();
+    }
+  });
+
+  console.log(
+    `Created analytics cohort: ${cohort.length} students, ${cohortEnrollments.length} enrollments, ${cohortPurchaseCount} purchases.`
+  );
+
+  // ─── Completion backfill ───
+  // An enrollment is complete exactly when every lesson in its course is
+  // complete; its completion date is the latest of those lesson completions.
+  sqlite.exec(`
+    UPDATE enrollments SET completed_at = (
+      SELECT CASE
+        WHEN COUNT(l.id) > 0 AND COUNT(l.id) = COUNT(lp.id)
+        THEN MAX(lp.completed_at)
+      END
+      FROM lessons l
+      JOIN modules m ON m.id = l.module_id
+      LEFT JOIN lesson_progress lp
+        ON lp.lesson_id = l.id
+        AND lp.user_id = enrollments.user_id
+        AND lp.status = '${LessonProgressStatus.Completed}'
+      WHERE m.course_id = enrollments.course_id
+    );
+  `);
+
+  const count = (table: string) =>
+    (sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number })
+      .n;
+  const completedEnrollments = (
+    sqlite
+      .prepare(
+        "SELECT COUNT(*) AS n FROM enrollments WHERE completed_at IS NOT NULL"
+      )
+      .get() as { n: number }
+  ).n;
+  const redeemedCoupons = (
+    sqlite
+      .prepare(
+        "SELECT COUNT(*) AS n FROM coupons WHERE redeemed_by_user_id IS NOT NULL"
+      )
+      .get() as { n: number }
+  ).n;
+
+  console.log("\n✓ Seed complete!");
+  console.log(`  Users: ${count("users")}`);
+  console.log(`  Categories: ${count("categories")}`);
+  console.log(
+    `  Courses: ${count("courses")} (${course1LessonIds.length} + ${course2LessonIds.length} lessons)`
+  );
+  console.log(`  Quizzes: ${count("quizzes")}`);
+  console.log(
+    `  Enrollments: ${count("enrollments")} (${completedEnrollments} completed)`
+  );
+  console.log(`  Lesson progress: ${count("lesson_progress")}`);
+  console.log(
+    `  Quiz attempts: ${count("quiz_attempts")} (${count("quiz_answers")} answers)`
+  );
+  console.log(`  Video watch events: ${count("video_watch_events")}`);
+  console.log(`  Course ratings: ${count("course_ratings")}`);
   console.log("  Lesson comments: 15 (4 questions awaiting an answer)");
-  console.log("  Purchases: 6 (5 individual + 1 team)");
-  console.log("  Teams: 1 (with 5 coupons)");
+  console.log(`  Purchases: ${count("purchases")}`);
+  console.log(
+    `  Teams: ${count("teams")} (${count("coupons")} coupons, ${redeemedCoupons} redeemed)`
+  );
 }
 
 seed().catch(console.error);
