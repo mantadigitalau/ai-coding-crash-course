@@ -24,6 +24,8 @@ import {
   isLessonCompleted,
   getNextIncompleteLesson,
 } from "./progressService";
+import { enrollUser, findEnrollment } from "./enrollmentService";
+import { createLesson } from "./lessonService";
 
 // Helper to create a module with lessons in the test db
 function createModuleWithLessons(
@@ -484,6 +486,70 @@ describe("progressService", () => {
       const next = getNextIncompleteLesson(base.user.id, base.course.id);
       expect(next).toBeDefined();
       expect(next!.id).toBe(lessons[0].id);
+    });
+  });
+
+  describe("markLessonComplete — enrollment completion", () => {
+    beforeEach(() => {
+      enrollUser(base.user.id, base.course.id, false, true);
+    });
+
+    it("marks the enrollment complete when the final remaining lesson is completed", () => {
+      const { lessons } = createModuleWithLessons(base.course.id, "Module 1", 1, 2);
+
+      markLessonComplete(base.user.id, lessons[0].id);
+      markLessonComplete(base.user.id, lessons[1].id);
+
+      expect(findEnrollment(base.user.id, base.course.id)!.completedAt).not.toBeNull();
+    });
+
+    it("leaves the enrollment incomplete when a non-final lesson is completed", () => {
+      const { lessons } = createModuleWithLessons(base.course.id, "Module 1", 1, 2);
+
+      markLessonComplete(base.user.id, lessons[0].id);
+
+      expect(findEnrollment(base.user.id, base.course.id)!.completedAt).toBeNull();
+    });
+
+    it("keeps the original completion date when the student re-completes a lesson", () => {
+      const { lessons } = createModuleWithLessons(base.course.id, "Module 1", 1, 1);
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+        markLessonComplete(base.user.id, lessons[0].id);
+
+        vi.setSystemTime(new Date("2026-02-01T00:00:00.000Z"));
+        markLessonComplete(base.user.id, lessons[0].id);
+      } finally {
+        vi.useRealTimers();
+      }
+
+      expect(findEnrollment(base.user.id, base.course.id)!.completedAt).toBe(
+        "2026-01-01T00:00:00.000Z"
+      );
+    });
+
+    it("keeps the completion date after a lesson is added to the course", () => {
+      const { module, lessons } = createModuleWithLessons(base.course.id, "Module 1", 1, 1);
+      markLessonComplete(base.user.id, lessons[0].id);
+      const { completedAt } = findEnrollment(base.user.id, base.course.id)!;
+
+      createLesson(module.id, "New lesson", null, null, null, null);
+
+      expect(completedAt).not.toBeNull();
+      expect(findEnrollment(base.user.id, base.course.id)!.completedAt).toBe(completedAt);
+    });
+
+    it("keeps the completion date after a lesson is un-completed", () => {
+      const { lessons } = createModuleWithLessons(base.course.id, "Module 1", 1, 2);
+      markLessonComplete(base.user.id, lessons[0].id);
+      markLessonComplete(base.user.id, lessons[1].id);
+      const { completedAt } = findEnrollment(base.user.id, base.course.id)!;
+
+      resetLessonProgress(base.user.id, lessons[1].id);
+
+      expect(completedAt).not.toBeNull();
+      expect(findEnrollment(base.user.id, base.course.id)!.completedAt).toBe(completedAt);
     });
   });
 });

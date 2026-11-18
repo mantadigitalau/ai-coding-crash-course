@@ -8,6 +8,7 @@ import {
   enrollments,
   LessonProgressStatus,
 } from "~/db/schema";
+import { markEnrollmentComplete } from "~/services/enrollmentService";
 
 // ─── Progress Service ───
 // Handles lesson completion tracking and course progress calculation.
@@ -56,6 +57,12 @@ export function getLessonProgressForCourse(userId: number, courseId: number) {
 }
 
 export function markLessonComplete(userId: number, lessonId: number) {
+  const progress = upsertCompletedLessonProgress(userId, lessonId);
+  completeEnrollmentIfAllLessonsDone(userId, lessonId);
+  return progress;
+}
+
+function upsertCompletedLessonProgress(userId: number, lessonId: number) {
   const existing = getLessonProgress(userId, lessonId);
 
   if (existing) {
@@ -80,6 +87,26 @@ export function markLessonComplete(userId: number, lessonId: number) {
     })
     .returning()
     .get();
+}
+
+// Course progress here is unweighted and lessons-only, matching the callers
+// that display it. Counts are compared directly rather than via the rounded
+// percentage, so 199/200 lessons never rounds up to "complete".
+function completeEnrollmentIfAllLessonsDone(userId: number, lessonId: number) {
+  const lessonCourse = db
+    .select({ courseId: modules.courseId })
+    .from(lessons)
+    .innerJoin(modules, eq(lessons.moduleId, modules.id))
+    .where(eq(lessons.id, lessonId))
+    .get();
+
+  if (!lessonCourse) return;
+
+  const { courseId } = lessonCourse;
+  const total = getTotalLessonCount(courseId);
+  if (total > 0 && getCompletedLessonCount(userId, courseId) === total) {
+    markEnrollmentComplete(userId, courseId);
+  }
 }
 
 export function markLessonInProgress(userId: number, lessonId: number) {
